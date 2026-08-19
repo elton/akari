@@ -20,10 +20,13 @@ __pycache__/
 .env.*
 !.env.example
 
-# Local media / model weights (large binaries)
-assets/local/
+# Model weights and generated video (large binaries)
 models/
 *.mp4
 *.mov
 *.safetensors
 *.gguf
+
+# Keyframe stills DO belong in the repo — they are the source of truth for
+# regenerating any clip, and they are small. Only the rendered video is excluded.
+!assets/akari/keyframes/*.png
