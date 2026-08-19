@@ -398,15 +398,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             uplinkSequenceValue = 0
         }
 
+        // ptt.down must reach the core BEFORE the first microphone frame can.
+        // startCapture() installs a tap whose callback runs on a CoreAudio thread, and
+        // that thread can enqueue an uplink frame before the main actor gets around to
+        // sending ptt.down — leaving the core receiving audio for a turn it does not yet
+        // know has begun. Announce the turn first, then open the mic; if the mic fails to
+        // open, retract the turn so the core is not left waiting for a ptt.up that the
+        // guard in endTurn() would swallow.
+        try? bridge.send(ControlMessage(body: .pttDown(PttPayload(source: source))))
         do {
             try audio.startCapture()
         } catch {
+            try? bridge.send(ControlMessage(body: .pttUp(PttPayload(source: source))))
             reportAudioError(error)
             menu.setTalking(false)
             return
         }
         isCapturing = true
-        try? bridge.send(ControlMessage(body: .pttDown(PttPayload(source: source))))
     }
 
     private func endTurn(source: PttSource) {

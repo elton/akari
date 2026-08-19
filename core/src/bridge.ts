@@ -1,5 +1,6 @@
 import { chmodSync, statSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
+import { connect as netConnect } from "node:net";
 import { dirname } from "node:path";
 import type { Socket, UnixSocketListener } from "bun";
 import {
@@ -32,6 +33,46 @@ import {
   type ToolConfirmRequestPayload,
   type ToolUndoablePayload,
 } from "./protocol.ts";
+
+/**
+ * Is somebody currently accepting connections on this socket path?
+ *
+ * Used before unlinking a leftover inode, to tell "a previous core crashed and left
+ * this behind" apart from "a core is running right now". Deleting the latter's pathname
+ * strands it: it keeps running with its metered Realtime session but becomes unreachable,
+ * while clients attach to whoever binds next.
+ *
+ * The verdicts mirror `CoreProcess.probeSocket` on the Swift side so both processes agree
+ * on what the socket means:
+ *   - connect succeeds        → live
+ *   - EAGAIN                  → live (the backlog is full, so somebody IS listening)
+ *   - ENOENT                  → not live (no socket at all)
+ *   - ECONNREFUSED            → not live (the inode outlived its server)
+ *   - anything else / timeout → treated as live, deliberately
+ *
+ * That last line is the conservative choice: refusing to start is recoverable, deleting a
+ * live core's socket is not.
+ */
+function isSocketLive(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (live: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(live);
+    };
+    const socket = netConnect(path);
+    const timer = setTimeout(() => finish(true), 500);
+    timer.unref?.();
+    socket.once("connect", () => finish(true));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      finish(!(error.code === "ENOENT" || error.code === "ECONNREFUSED"));
+    });
+  });
+}
 
 /**
  * Unix domain socket server. The core listens, akari.app connects.
@@ -201,9 +242,21 @@ export class Bridge {
     }
     assertPrivate(directory, "directory", 0o700);
 
-    // A crash leaves the inode behind and bind() would fail with EADDRINUSE.
-    // Safe because only one core may run at a time; a live peer would have
-    // been rejected by the already_connected path instead.
+    // A crash leaves the inode behind and bind() would fail with EADDRINUSE, so the
+    // stale one has to go. But it must be PROVEN stale first.
+    //
+    // The earlier reasoning here — "safe because only one core may run at a time; a live
+    // peer would have been rejected by the already_connected path" — was wrong.
+    // already_connected is an application-layer rejection that happens after a client
+    // connects to US. A second core never connects to the first one: it unlinks the
+    // pathname and binds its own. The first core keeps running, keeps its metered Realtime
+    // session open, and can never be reached again, while every client attaches to the
+    // newcomer. Refuse to start instead.
+    if (await isSocketLive(this.#socketPath)) {
+      throw new Error(
+        `another core is already serving ${this.#socketPath}; refusing to take over its socket`,
+      );
+    }
     await unlink(this.#socketPath).catch(() => {});
 
     // bind() happens inside Bun.listen. Narrowing umask around it closes the

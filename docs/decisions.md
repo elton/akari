@@ -612,3 +612,55 @@ VAD 与打断（实测首包 473ms）。改走 CF 就必须退回拼装方案：
 3. 本地路径需要下载 22.8 GB 权重 —— 该 HF repo 是 **gated**，
    需用户先申请访问并 `huggingface-cli login`，这一步无法由程序代劳
 4. 自动降级策略：网络不可用或 CF 额度耗尽时自动切本地，并在界面明示当前在用哪一档
+
+---
+
+## 第三轮：外部（Codex）审查发现的两条
+
+**日期**：2026-08-19
+
+前两轮加固全部由 Claude 自己的 agent 完成 —— 包括那些做得很扎实的对抗性验证
+（写假 core 骗出剪贴板、隔离副本撤销修复确认测试会红）。
+启用外部审查后，Codex 独立审同一份 diff，**又抓到两条**：
+
+### [P1] core 会 unlink 一个活着的 core 的 socket
+
+`core/src/bridge.ts` 在 bind 前无条件 `unlink`，注释里的理由是：
+
+> Safe because only one core may run at a time; a live peer would have been rejected
+> by the already_connected path instead.
+
+**这个理由是错的。** `already_connected` 是应用层拒绝，发生在客户端连上*我们*之后；
+而第二个 core 根本不会连第一个 core —— 它直接删掉路径名再 bind 自己的。
+第一个 core 继续运行、继续挂着**按时长计费的 Realtime 会话**，但再也无法被连接，
+之后所有客户端都接到新的那个上。
+
+**值得记下的是我们自己的验证也看见了这个现象，但归成了 P3**，
+描述为「开发时的不便」。定级错了：它让一个付费会话变成不可恢复的孤儿。
+外部审查的价值不只在于发现没看见的问题，也在于纠正看见了却低估的问题。
+
+**修法**：unlink 前先 probe，判据与 Swift 侧 `CoreProcess.probeSocket` 对称
+（connect 成功或 EAGAIN → live；ENOENT / ECONNREFUSED → 可清理；
+其余与超时**一律当作 live**）。最后一条是刻意的保守选择：
+拒绝启动是可恢复的，删掉活 core 的 socket 不是。
+
+### [P2] ptt.down 与首个麦克风帧的顺序竞态
+
+`AppDelegate.beginTurn` 先 `startCapture()` 后发 `ptt.down`。
+`startCapture()` 安装的 tap 回调跑在 CoreAudio 线程上，可能抢在主 actor 之前把上行音频帧推出去
+—— core 于是**在不知道回合已开始的情况下先收到了音频**，违反 protocol.md 的回合顺序。
+
+**修法**：先发 `ptt.down` 再开麦克风；开麦失败则补发 `ptt.up` 撤销该回合
+（否则 core 会一直等一个永远不来的 `ptt.up`，而 `endTurn` 的 `guard isCapturing` 会吞掉它）。
+
+### 验证
+
+- socket 抢占：新增 `core/src/bridge.socket-takeover.test.ts` 两条。
+  隔离副本撤掉 live 检查后，「第二个 core 拒绝接管」立刻失败；
+  对照组「stale socket 仍能清理」保持通过，确认没有修过头。
+- PTT 顺序：**没有加自动化测试**。`beginTurn` 是 `AppDelegate` 的 private 方法，
+  测它需要先把 PTT 状态机抽成独立类型 —— 那是一个只有单一实现的新抽象。
+  这条只做了编译验证与代码走查，**需要人工验证**：按住热键说话，
+  确认 core 日志中 `ptt.down` 早于第一个上行音频帧。
+
+`make check`：swift build 零警告 / swift test 80 passed / typecheck 干净 / bun test 162 pass 0 fail。
