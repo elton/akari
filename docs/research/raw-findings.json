@@ -1,0 +1,1826 @@
+{
+  "qwen-cloud": {
+    "topic": "Qwen 模型云端 API 现状（2026 年 8 月）— 面向 macOS 桌面 AI 虚拟人 akari 的选型调研",
+    "summary": "**结论先行：akari 的对话大脑用 `qwen3.7-flash`（¥0.2/¥0.8 每百万 token，1M 上下文，原生看图/看视频），语音走\"ASR+LLM+TTS 拼装\"而不是端到端 Realtime——成本差 4-5 倍（约 ¥40/月 vs ¥180/月，按每天 1 小时算）。**\n\n代际已经跑到 Qwen3.8，没有 Qwen4。旗舰 `qwen3.8-max`（2.4T MoE，2026-08-03 发布，¥12/¥36）→ `qwen3.7-max`（¥12/¥36）→ `qwen3.7-plus`（¥2/¥8）→ `qwen3.6-flash`（¥1.2/¥7.2）→ `qwen3.7-flash`（¥0.2/¥0.8）。全系 1M 上下文、131072 最大输出、262144 思维链预算，**且 plus/flash/max 全部原生带视觉**（图像+视频输入），独立的 `qwen3-vl-plus` / `qwen3-vl-flash` 仍在但已是次选——截屏理解直接用主力模型即可，不需要单独接 VL。\n\n实时语音有两条线：`qwen3.5-omni-plus/flash-realtime`（全模态，能同时收音频+视频帧，60+ 语言输入 / 30+ 语言输出，55 个音色）和 `qwen-audio-3.0-realtime-plus/flash`（纯音频，上下文仅 40960，但支持声音复刻 + `smart_turn` 说话人锁定）。三种接入协议：WebSocket、WebRTC（DataChannel 名叫 `oai-events`，形似 OpenAI 但事件协议**不兼容**）、AOQ（自研 QUIC，仅 iOS/Android SDK，无 macOS）。打断（barge-in）原生支持，`semantic_vad` 能过滤背景人声。官方延迟基准 flash ≈5.1s、plus ≈5.8s（疑为整轮完成时间而非首包，存疑）。\n\nASR 最优 `qwen-audio-3.0-asr-flash-streaming`（¥0.00033/秒 ≈ ¥1.19/小时，流式 WebSocket）；离线 `qwen-audio-3.0-asr-flash` 更便宜（¥0.00022/秒），支持 7 大方言 + 20+ 口音 + 30 语种。TTS 最优 `qwen-audio-3.0-tts-flash`（¥1/万字符，首包 <200ms），高质量用 `qwen-audio-3.0-tts-plus`（Artificial Analysis Speech Arena 榜首）。**声音复刻免费**，10-20 秒样本，每模型系列可建 1000 个音色，且复刻音色能用在 realtime 上——这对\"虚拟女友固定音色\"是关键能力。\n\n接入完全 OpenAI 兼容（`npm install openai` / `pip install openai` 直接用），但域名已迁移到 workspace 专属：`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`，旧的 `dashscope.aliyuncs.com` 仍可用。Function calling 全系支持。",
+    "options": [
+      {
+        "name": "方案 A（推荐）：拼装式语音链路 — ASR 流式 + qwen3.7-flash + TTS 流式",
+        "how": "用 macOS AVAudioEngine 采音 → WebSocket 接 `qwen-audio-3.0-asr-flash-streaming` 做流式转写 → 文本喂给 `qwen3.7-flash`（OpenAI 兼容 /chat/completions，stream=true，带 tools 做 function calling）→ 逐句切分后 WebSocket 接 `qwen-audio-3.0-tts-flash` 流式合成 → AVAudioPlayerNode 播放。截屏理解时把 base64 图片塞进同一个 qwen3.7-flash 请求的 image_url 字段。音色用声音复刻先建一个专属 voice_id。Node/Bun 侧用 `openai` 官方包即可；ASR/TTS 的 WebSocket 需要手写（官方只有 Python dashscope>=1.23.9 和 Java>=2.20.9 SDK）。",
+        "pros": "成本最低（每天 1 小时约 ¥38-64/月）；每一段都能单独换供应商或换成本地模型；ASR 结果是文本，方便做记忆、检索、日志；打断逻辑完全自己控（本地 VAD 一停就 cancel TTS，比云端 VAD 更快）；qwen3.7-flash 自带视觉，看屏幕不另花钱；上下文缓存（cache hit ¥0.04/1M）能进一步压成本",
+        "cons": "三段串联，端到端延迟叠加（ASR 尾包 + LLM 首 token + TTS 首包，乐观 700ms-1.2s）；丢失语气/情绪等副语言信息，模型听不出用户是在开玩笑还是生气；需要自己实现 VAD、断句、打断状态机，工程量最大的一块；TTS 的 WebSocket 协议要手写",
+        "maturity": "production-ready",
+        "cost": "约 ¥38-64/月（每天 1 小时）；工程量 2-3 周（含 VAD/打断状态机 + 三个 WebSocket 客户端）"
+      },
+      {
+        "name": "方案 B：端到端实时 — qwen3.5-omni-flash-realtime（WebSocket 或 WebRTC）",
+        "how": "WebSocket 连 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen3.5-omni-flash-realtime`，Header 带 `Authorization: Bearer $DASHSCOPE_API_KEY`。session.update 里配 `turn_detection: {type: \"semantic_vad\", threshold: 0.5, silence_duration_ms: 500-800}`、`audio.input.format {type:\"pcm\", sample_rate:16000}`、`audio.output.format {sample_rate:24000}`、`voice: \"Tina\"`。input_audio_buffer.append 推 PCM，服务端自动 VAD 断句并回 response.audio.delta。macOS 上也可以走 WebRTC：POST SDP Offer 到 `https://{endpoint}/api/v1/webrtc/realtime?model=...`（Content-Type: application/sdp），DataChannel 名 `oai-events`。",
+        "pros": "一跳完成，工程量最小；模型能听懂语气/情绪/环境音，回复的副语言表现更自然；打断由服务端 VAD 自动处理（speech_started 自动 cancel 正在播的回复）；能同时收视频帧（摄像头或屏幕），做\"她看着你的屏幕\"；WebRTC 路径自带回声消除和降噪，省掉一大块 macOS 音频工程；55 个音色，含大量方言和外语角色音",
+        "cons": "贵 4-5 倍（约 ¥150-210/月）；**不支持上下文缓存**，多轮成本线性甚至超线性增长；RPM 仅 60、TPM 仅 10 万，单用户够但没冗余；官方延迟基准 flash ≈5.1s（含 ~2s 非 LLM 开销），存疑但不乐观；事件协议不是 OpenAI Realtime 兼容，现成的 openai-realtime SDK 用不了；音频上下文被硬性截断（flash 80 轮/480 秒，plus 100 轮/600 秒），长对话会\"忘记\"早期语音；单 session 最长 120 分钟必须重连",
+        "maturity": "production-ready",
+        "cost": "约 ¥150-210/月（每天 1 小时，含上下文重复计费估算）；工程量 1 周左右"
+      },
+      {
+        "name": "方案 C：qwen-audio-3.0-realtime-flash（纯音频实时，带声音复刻）",
+        "how": "同样是 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen-audio-3.0-realtime-flash`，但这是纯语音对话模型（无视觉）。独有 `smart_turn` 模式，能锁定目标说话人、过滤旁人和背景噪声。支持把声音复刻出来的 voice_id 直接当 voice 参数用。视觉需求（看屏幕）另外单独调 qwen3.7-flash。",
+        "pros": "三种交互模式（server VAD / smart_turn / 手动）里的 smart_turn 对嘈杂环境最友好——桌面场景经常有视频、音乐在放，这个很实用；支持声音复刻，能给 akari 一个独一无二的固定音色（omni-realtime 的复刻支持文档未明说）；function calling 完整支持；音频输入价 ¥30/1M 比 omni-plus 的 ¥80 便宜",
+        "cons": "上下文只有 40960 token（最大输入 16384），比 omni 的 262144 小一个数量级，长对话记忆得自己在外部维护；没有视觉，看屏幕要拆成两次调用，多一跳延迟；未查到官方延迟数据；音频 token 换算率未核实，成本估算不确定",
+        "maturity": "usable",
+        "cost": "约 ¥180-230/月（每天 1 小时，估算）；工程量 1-1.5 周"
+      },
+      {
+        "name": "方案 D：混合 — 平时 A，需要\"读情绪\"时切 B",
+        "how": "默认走方案 A 的拼装链路（便宜、可控）；检测到特定场景（用户长时间沉默后开口、情绪关键词、用户主动说\"陪我聊会儿\"）时，临时建立 omni-realtime 会话走端到端。两条链路共享同一份对话历史（realtime 侧靠 session.update 注入摘要）。",
+        "pros": "日常成本按方案 A 走，只在高价值时刻付实时溢价；能拿到端到端的情绪感知而不用全天候烧钱",
+        "cons": "两套音频管线，状态同步（谁在说、播到哪、历史如何合并）是纯粹的复杂度来源；违背\"最小可行\"原则，除非方案 A 上线后真的验证了拼装链路的表达力不够，否则不该先做",
+        "maturity": "experimental",
+        "cost": "约 ¥60-100/月；工程量在 A 之上再加 1-2 周"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "当前最新代际是 Qwen3.8，不存在 Qwen4。`qwen3.8-max` 于 2026-08-03 正式发布，2.4T 参数稀疏 MoE，约 95B 激活参数，原生多模态（文本/图像/视频）。",
+        "confidence": "high",
+        "source_url": "https://www.developersdigest.tech/blog/qwen-3-8-max-release-2026"
+      },
+      {
+        "fact": "`qwen3.8-max`：上下文 1,000,000；最大输入 991,808（思考模式 983,616）；最大输出 131,072；最大思维链 262,144。北京地域价格 输入 ¥12 / 输出 ¥36 每百万 token；缓存命中 ¥1.5；显式缓存创建 ¥15、命中 ¥1；Batch 输入 ¥6 / 输出 ¥18。RPM 30000，TPM 5,000,000。支持图像+视频输入、Function Calling、结构化输出、联网搜索、前缀续写、上下文缓存、Batch 推理；不支持微调。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-8-max"
+      },
+      {
+        "fact": "`qwen3.7-max`：上下文 1,000,000；最大输入 991,808；最大输出 131,072；最大思维链 262,144。北京 输入 ¥12 / 输出 ¥36 每百万 token；缓存命中 ¥2.4；显式缓存创建 ¥15、命中 ¥1.2；Batch ¥6/¥18。RPM 30000，TPM 5,000,000。国际站（新加坡/法兰克福/弗吉尼亚/东京）限流大幅降低（60-600 RPM，1-10M TPM）。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-7-max"
+      },
+      {
+        "fact": "`qwen3.7-plus`：上下文 1,000,000；最大输入 991,808（思考模式 983,616）；最大输出 131,072；最大思维链 262,144。阶梯计价（北京，每百万 token）：输入 ≤256K 时 输入 ¥2 / 输出 ¥8 / 缓存命中 ¥0.4 / 显式缓存创建 ¥2.5、命中 ¥0.2；256K<输入≤1M 时 输入 ¥6 / 输出 ¥24 / 缓存命中 ¥1.2 / 显式缓存创建 ¥7.5、命中 ¥0.6。RPM 30000，TPM 5,000,000。**原生支持图像和视频输入**、Function Calling、结构化输出、联网搜索、上下文缓存。快照版 `qwen3.7-plus-2026-05-26`，另有 `qwen3.7-plus-us`。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-7-plus"
+      },
+      {
+        "fact": "`qwen3.7-flash`：上下文 1,000,000；最大输入 991,808；最大输出 131,072；最大思维链 262,144。三档阶梯（北京，每百万 token）：≤32K 输入 ¥0.2 / 输出 ¥0.8（缓存命中 ¥0.04）；32K-256K 输入 ¥0.6 / 输出 ¥2.4；256K-1M 输入 ¥1.2 / 输出 ¥4.8。RPM 30000，TPM 5,000,000。**支持图像和视频输入** + Function Calling + 结构化输出 + 上下文缓存。这是全系性价比最高的带视觉模型。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-7-flash"
+      },
+      {
+        "fact": "`qwen3.6-flash`：上下文 1,000,000，最大输出 65,536。北京价格 输入 ≤256K 时 ¥1.2 / 输出 ¥7.2 每百万 token；256K-1M 时 ¥4.8 / ¥28.8。原生视觉语言模型。注意它比 qwen3.7-flash **贵 6 倍**，选型时别被版本号误导。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-6-flash"
+      },
+      {
+        "fact": "视觉理解：`qwen3.8-max`、`qwen3.7-plus`、`qwen3.7-flash`、`qwen3.6-flash`、`qwen3.5-plus/flash` 支持最长 2 小时视频 / 2GB；专用 VL 模型 `qwen3-vl-plus`、`qwen3-vl-flash` 支持最长 1 小时视频 / 2GB。图片传入方式：公网 URL 的 image_url、Base64 data URL（`data:image/png;base64,{...}`）、或 DashScope SDK 专用的 `file://{path}` 本地路径。Qwen2.5-VL 在 480×480 到 2560×2560 分辨率区间定位精度最好。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/vision"
+      },
+      {
+        "fact": "实时全模态模型 ID：`qwen3.5-omni-plus-realtime`、`qwen3.5-omni-flash-realtime`，以及老版 `qwen3-omni-flash-realtime`。60+ 语言音频输入，30+ 语言语音输出。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "`qwen3.5-omni-flash-realtime`：上下文 262,144，最大输入 196,608，最大输出 65,536。北京价格（每百万 token）：文本/图像/视频输入 ¥3.3；音频输入 ¥27；文本输出 ¥20；音频输出 ¥107（音频回复中的文本部分不另计费）。新加坡：¥4.12 / ¥33.72 / ¥24.73 / ¥132.65。RPM 60，TPM 100,000。支持 Function Calling 和联网搜索；**不支持上下文缓存、Batch、微调**。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-5-omni-flash-realtime"
+      },
+      {
+        "fact": "`qwen3.5-omni-plus-realtime`：上下文 262,144，最大输入 196,608，最大输出 65,536。北京价格（每百万 token）：文本/图像/视频输入 ¥10；音频输入 ¥80；文本输出 ¥60；文本+音频输出 ¥300。新加坡：¥15.74 / ¥123.65 / ¥92.93 / ¥464.64。RPM 60，TPM 100,000。支持 Function Calling、联网搜索；不支持结构化输出和上下文缓存。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen3-5-omni-plus-realtime"
+      },
+      {
+        "fact": "Realtime WebSocket 端点：北京 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model={model_name}`；新加坡 `wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime`。鉴权 Header：`Authorization: Bearer $DASHSCOPE_API_KEY`。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Realtime 事件协议**与 OpenAI Realtime API 不兼容**（概念相似但事件定义不同）。客户端事件包括 `session.update`、`input_audio_buffer.append`、`input_audio_buffer.commit`、`response.create`、`response.cancel`；服务端事件用 `response.*` 和 `conversation.item.*` 前缀。",
+        "confidence": "medium",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Realtime 三种断句模式：`server_vad`（服务端 VAD，可配 silence_duration_ms）、`semantic_vad`（语义 VAD，Qwen3.5-Omni 系列推荐，能识别对话意图、避免背景噪声误触发）、手动模式（turn_detection=null，客户端自己 commit）。参数：`threshold` 0.1-0.5（越高越不敏感，嘈杂环境建议 0.5）、`silence_duration_ms` 200-6000（建议 500-600）、`prefix_padding_ms`。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "打断（barge-in）原生支持：`input_audio_buffer.speech_started` 触发时系统自动取消当前播放并清空缓冲区；也可手动调 `response.cancel`。WebRTC 路径额外自带回声消除和降噪。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Realtime 音频格式（仅 Qwen3.5-Omni 系列）：输入 PCM/WAV，采样率 8000/16000/24000/48000 Hz（默认 16000）；输出同样四档（默认 24000）。配置字段 `audio.input.format` / `audio.output.format`，老字段 `input_audio_format` / `output_audio_format` 已废弃但仍可用。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Realtime 会话限制：单会话最长 120 分钟，超时服务端主动断开。音频上下文上限：plus 100 轮 / 600 秒，flash 80 轮 / 480 秒。视频/图像上下文：plus 50 轮 / 240 秒，flash 50 轮 / 120 秒。老版 qwen3-omni-flash-realtime 仅 8 轮。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "官方延迟基准（DashScope WebSocket，文本输入，voice=Tina，silence_duration_ms=800）：`qwen3.5-omni-flash-realtime` 总延迟约 5.1 秒（其中 LLM 约 3.1 秒，其余约 2.0 秒为链路开销）；`qwen3.5-omni-plus-realtime` 约 5.8 秒。文档未明确这是首包延迟还是整轮完成时间，从数值判断更可能是整轮完成。",
+        "confidence": "low",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Realtime 支持 55 个音色（47 个多语种 + 8 个方言）。Qwen3.5-Omni 系列默认音色为 `Tina`。女声含 Tina / Cindy / Serena / Maia / Momo / Angel / Mia / Jennifer / Katerina / Sohee / Sonrisa / Marina 等；男声含 Ethan / Raymond / Evan / Ryan / Aiden / Harvey / Andre / Emilien / Alek 等；中文方言音色含 Dylan（北京）/ Eric（成都）/ Peter（天津）/ Marcus（陕西）/ Li（南京）/ Rocky（粤语）/ Joseph Chen（闽南）。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/omni-voice-list"
+      },
+      {
+        "fact": "另有纯音频实时对话模型 `qwen-audio-3.0-realtime-plus` 和 `qwen-audio-3.0-realtime-flash`，定位语音助手/客服/AI 陪伴。独有 `smart_turn` 语义断句模式，带说话人增强，能锁定目标说话人、过滤旁人语音和背景噪声。支持 Function Calling、系统音色 + 声音复刻。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-audio-realtime-user-guides"
+      },
+      {
+        "fact": "`qwen-audio-3.0-realtime-flash`：最大输入 16,384，最大输出 8,192，上下文 40,960。北京价格（每百万 token）：文本输入 ¥3；音频输入 ¥30；文本输出 ¥30；音频输出 ¥100。新加坡：¥3.372 / ¥33.724 / ¥33.724 / ¥112.413。RPM 60，TPM 100,000。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-audio-3-0-realtime-flash"
+      },
+      {
+        "fact": "`qwen-audio-3.0-realtime-plus`：最大输入 16,384，最大输出 8,192，上下文 40,960。北京价格（每百万 token）：文本输入 ¥5；音频输入 ¥40；文本输出 ¥40；音频输出 ¥150。新加坡：¥5.995 / ¥47.963 / ¥47.963 / ¥179.861。RPM 60，TPM 100,000。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-audio-3-0-realtime-plus"
+      },
+      {
+        "fact": "音频 token 换算率：Qwen3.5-Omni 系列为 音频时长(秒) × 7 tokens；Qwen3-Omni-Flash 为 ×12.5；老版 Qwen-Omni-Turbo 为 ×25。不足 1 秒按 1 秒计。qwen-audio-3.0-realtime 系列的换算率未在文档中查到。",
+        "confidence": "medium",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-omni"
+      },
+      {
+        "fact": "ASR 模型 ID 全表：Qwen-Audio-3.0 系列 `qwen-audio-3.0-asr-flash`（非实时 HTTP）、`qwen-audio-3.0-asr-flash-streaming`（实时 WebSocket）、`qwen-audio-3.0-asr-flash-filetrans`（文件转写，最长 12 小时，支持说话人分离）；Qwen3-ASR 系列 `qwen3-asr-flash`、`qwen3-asr-flash-realtime`、`qwen3-asr-flash-filetrans`（含 -2026-02-10 等快照）；Fun-ASR 系列 `fun-asr`、`fun-asr-realtime`、`fun-asr-flash-8k-realtime`、`fun-asr-mtl`；Paraformer 系列仍在但官方建议迁移。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/asr-model"
+      },
+      {
+        "fact": "`qwen-audio-3.0-asr-flash`：北京 ¥0.00022/秒音频，新加坡 ¥0.00026/秒。RPM 600。支持 context 上下文能力，可转写 5 分钟以内音频。语言覆盖普通话、吴语、湘语、赣语、客家话、闽语、粤语 7 大方言 + 20 多种地方口音，另加英日韩越泰印尼马来菲律宾印地阿拉伯法德西葡俄意荷瑞典丹麦芬兰挪威希腊波兰捷克匈牙利罗马尼亚保加利亚克罗地亚斯洛伐克，共 30 语种。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-audio-3-0-asr-flash"
+      },
+      {
+        "fact": "`qwen-audio-3.0-asr-flash-streaming`：北京 ¥0.00033/秒音频（≈¥1.19/小时），新加坡 ¥0.00066/秒。RPM 1200。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-audio-3-0-asr-flash-streaming"
+      },
+      {
+        "fact": "Qwen-Audio-3.0-ASR-Flash 于 2026-07-31 发布，重点优化专业词汇识别、上下文一致性、行业词识别和热词定制，医疗场景准确率超 95%，并具备语音润色能力可直接输出结构化文本。",
+        "confidence": "medium",
+        "source_url": "https://finance.sina.com.cn/tech/roll/2026-07-31/doc-iniksxny9283189.shtml"
+      },
+      {
+        "fact": "TTS 模型 ID 全表：`qwen-audio-3.0-tts-flash`、`qwen-audio-3.0-tts-plus`、`qwen3-tts-flash-realtime`、`qwen3-tts-instruct-flash-realtime`、`cosyvoice-v3-flash`、`cosyvoice-v3-plus`、`cosyvoice-v3.5-flash`、`cosyvoice-v3.5-plus`、`cosyvoice-v2`。全部支持 WebSocket 双工流式输入输出。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-tts-realtime"
+      },
+      {
+        "fact": "`qwen-audio-3.0-tts-flash`：北京 ¥1 / 万字符，新加坡 ¥1.12413 / 万字符。首包延时控制在 200ms 以内。RPM 180（两个地域相同）。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-audio-3-0-tts-flash"
+      },
+      {
+        "fact": "Qwen-Audio-TTS 系统音色（exact voice 参数值）：plus 模型有 `longanlingxin`（女，温暖共情）、`longanlufeng`（男，明亮开朗）；flash 模型有 `longanfengyue`（女，自然亲和）、`longanyuanfei`（女，高傲）、`longanlingxi`（女，可爱甜美）、`longanxiaoxin`（女，友好活泼）、`longanhuan_v3.6`（女）、`longjielidou_v3.6`（男童）、`longpaopao_v3.6`（女，软萌）、`longhuohuo_v3.6`（男童，顽皮）、`longchuanshu_v3.6`（男，四川口音）、`loongmary`（女，英式英语）、`loongeva_v3.6`（女，美式英语）、`loongjohn`（男，美式英语）。两个模型另各提供 500+ 个通过声音复刻生成的基础音色（Excel 下载）。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/en/model-studio/qwen-audio-tts-voice-list"
+      },
+      {
+        "fact": "声音复刻支持的模型：`qwen-audio-3.0-tts-plus`、`qwen-audio-3.0-tts-flash`、`qwen-audio-3.0-realtime-plus`、`qwen-audio-3.0-realtime-flash`、CosyVoice v1/v2/v3-flash/v3-plus/v3.5-flash/v3.5-plus、MiniMax speech-2.8-hd/02-hd/2.8-turbo/02-turbo、Qwen-TTS `qwen3-tts-vc-2026-01-22` 及其 realtime 变体。样本要求：推荐 10-20 秒，最长不超过 60 秒（MiniMax 要求不低于 10 秒、最长 5 分钟）。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/voice-cloning-user-guide"
+      },
+      {
+        "fact": "声音复刻 API：`POST https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/tts/customization`，model 填 `voice-enrollment`，action 填 `create_voice`。返回的音色标识：多数模型在 `output.voice_id`，Qwen-TTS 在 `output.voice`。计费：Qwen-Audio-TTS / Qwen-Audio-Realtime / CosyVoice 复刻创建**免费**；MiniMax 创建免费但首次合成收 ¥9.9；Qwen-TTS 按 ¥0.01/个，前 90 天免费 1000 个。每账号每模型系列上限 1000 个音色，一年未使用自动删除。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/voice-cloning-user-guide"
+      },
+      {
+        "fact": "OpenAI 兼容 base_url（推荐的 workspace 专属域名）：国内北京 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`；国际新加坡 `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。旧端点 `https://dashscope.aliyuncs.com/compatible-mode/v1`（国内）和 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`（国际）仍可用。环境变量名 `DASHSCOPE_API_KEY`。SDK 直接用官方 openai 包：`pip install openai` / `npm install openai`。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions"
+      },
+      {
+        "fact": "百炼支持三种实时接入协议：AOQ（基于 QUIC 深度定制，适合移动端原生应用，官方提供 iOS Swift SDK 和 Android SDK，**无 macOS 版本**）、WebRTC（浏览器原生 JS API，也可用 Python aiortc）、WebSocket。WebRTC 信令：`POST https://{endpoint}/api/v1/webrtc/realtime?model=qwen3.5-omni-plus-realtime`，Content-Type: application/sdp，Header `Authorization: Bearer $DASHSCOPE_API_KEY`，返回 Answer SDP（需把换行符规范化为 \\r\\n 才能 setRemoteDescription）。DataChannel 名为 `oai-events`。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/best-practice-webrtc-omni-realtime"
+      },
+      {
+        "fact": "官方 SDK 版本要求：Realtime 需 dashscope Python ≥1.23.9、Java ≥2.20.9；TTS 取消功能需 Python ≥1.26.4、Java ≥2.22.26（部分指标需 ≥2.18.0）。**没有官方 Node.js Realtime SDK**——Node/Bun 侧需自己用 ws 实现协议，或走浏览器 WebRTC 路径。DashScope 官方 Node SDK 仓库为 dashscope/dashscope-sdk-nodejs，包名 `dashscope-sdk-official`，但覆盖面远不如 Python。",
+        "confidence": "medium",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Function Calling 支持情况：qwen3.8-max / qwen3.7-max / qwen3.7-plus / qwen3.7-flash / qwen3.6-flash 全部支持；qwen3.5-omni-*-realtime 支持（但**联网搜索与工具调用不能同时开启**）；qwen-audio-3.0-realtime-* 支持。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/realtime"
+      },
+      {
+        "fact": "Qwen-Agent 框架（github.com/QwenLM/Qwen-Agent）仍在活跃维护，PyPI 包名 `qwen-agent`，2026 年 2 月发布 0.0.34 版，文档最后更新 2026-03-04。支持 Function Calling、MCP、Code Interpreter、RAG、Chrome 扩展。2026-02-16 开源 Qwen3.5 并提供 Qwen3.5 Agent Demo；2026-01-27 开源 DeepPlanning agent 评测基准。仅 Python，无 TS/Swift 版本。",
+        "confidence": "medium",
+        "source_url": "https://github.com/QwenLM/Qwen-Agent"
+      },
+      {
+        "fact": "新人免费额度：每个模型独立 100 万 token，有效期 90 天（从账号开通、模型发布、审批通过三者中最晚的一个起算），**仅限华北2（北京）地域**，不可跨模型转移、不可延期。ASR 类模型需在百炼控制台业务空间逐一开启权限后才能调用并消耗免费额度。Realtime 模型自动扣减免费额度。",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/new-free-quota"
+      },
+      {
+        "fact": "Qwen-Audio-3.0-TTS-Plus 在 Artificial Analysis Speech Arena 的 Provider Voices 榜单上排名第一，超过 Simba 3.2、Gemini 3.1 Flash TTS 和 Sonic 3.5。Qwen-Audio-3.0-TTS 于 2026-07-20 发布，分 Flash 和 Plus 两档，覆盖 16 种语言。",
+        "confidence": "medium",
+        "source_url": "https://www.marktechpost.com/2026/07/20/alibabas-tongyi-lab-releases-qwen-audio-3-0-tts-a-hosted-text-to-speech-model-in-flash-and-plus-tiers-across-16-languages/"
+      },
+      {
+        "fact": "成本估算（每天聊 1 小时 × 30 天，假设用户说话 15 分钟/小时、AI 说话 15 分钟/小时、约 60 轮对话）：方案 A 拼装式（asr-flash-streaming VAD 门控 + qwen3.7-flash + tts-flash）≈ ¥1.25/小时 → **约 ¥38/月**；若 ASR 全程开流则 ≈ ¥2.14/小时 → 约 ¥64/月。方案 B（qwen3.5-omni-flash-realtime，含上下文重复计费）≈ ¥5-7/小时 → **约 ¥150-210/月**。方案 C（qwen-audio-3.0-realtime-flash）≈ **约 ¥180-230/月**。方案 D（qwen3.5-omni-plus-realtime）≈ ¥15-18/小时 → **约 ¥450-540/月**。",
+        "confidence": "low",
+        "source_url": "https://help.aliyun.com/zh/model-studio/model-pricing"
+      }
+    ],
+    "gotchas": [
+      "**域名已迁移到 workspace 专属格式**，所有新文档用 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/...`，WorkspaceId 要去百炼控制台的业务空间详情页拿。旧的 `dashscope.aliyuncs.com` / `dashscope-intl.aliyuncs.com` 仍能用但官方说新域名性能和稳定性更好。文档里 WebRTC 那部分甚至只写了占位符 `{endpoint}`，实际域名得从控制台确认——这块建议先跑通一个 curl 再写代码。",
+      "**Realtime 协议不是 OpenAI Realtime 兼容的**。虽然 WebRTC 的 DataChannel 名叫 `oai-events`（明显致敬 OpenAI），事件名也长得像（session.update / input_audio_buffer.append / response.cancel），但官方明确说\"概念相似、不直接兼容\"。任何基于 openai-realtime-api 的现成客户端库都不能直接用，得自己对着文档写协议层。",
+      "**Realtime 模型不支持上下文缓存**（qwen3.5-omni-*-realtime 和 qwen-audio-3.0-realtime-* 都是）。多轮对话每一轮都要重新计费全量上下文，音频 token 又比文本贵 8-10 倍，成本增长很陡。这是拼装方案比端到端便宜 4-5 倍的主要原因——拼装方案的 LLM 那一段能吃到 ¥0.04/1M 的缓存命中价。",
+      "**Realtime 限流只有 RPM 60 / TPM 100,000**，比文本模型的 RPM 30000 / TPM 5M 低两三个数量级。单用户自用够，但如果 akari 以后要开放给别人，这个限额会立刻成为瓶颈，得提前走工单申请提额。",
+      "**音频上下文会被硬性截断**：flash 只保留 80 轮 / 480 秒音频，plus 是 100 轮 / 600 秒。也就是说端到端方案里，超过 8-10 分钟前的语音内容模型是\"听不到\"的。长期记忆必须自己在外部维护并注入摘要，不能指望 realtime 会话自己记住。另外单会话最长 120 分钟就会被服务端断开，要做重连 + 状态恢复。",
+      "**官方延迟基准看着不乐观**：flash ≈5.1 秒、plus ≈5.8 秒，其中约 2 秒是非 LLM 的链路开销。文档没说清这是首包还是整轮，但即便是整轮，对\"虚拟女友即时回应\"的体验也偏慢。**上线前必须自己实测首包延迟**，别信这个数字就做决策——这是我最不确定的一项。",
+      "**没有官方 Node.js Realtime SDK**。只有 Python（dashscope≥1.23.9）和 Java（≥2.20.9）。项目栈是 Bun/Node 的话，WebSocket 协议层得手写。AOQ SDK 只有 iOS 和 Android，**没有 macOS 版本**，所以 Swift 侧也用不上那套 QUIC 优化，只能走 WebSocket 或 WebRTC。",
+      "**国内站和国际站是两套独立体系**：账号、API Key、控制台都不通用，Key 不能跨站使用。国际站（新加坡）价格普遍比北京贵 25%-55%（比如 omni-plus-realtime 音频输入 ¥123.65 vs ¥80），且**新人免费额度只在华北2（北京）地域发放**。除非有出海需求，否则一律用国内站。",
+      "**ASR 模型需要在控制台业务空间里逐一开启权限**才能调用和消耗免费额度，不是开通百炼就自动可用。第一次调用报权限错误时别以为是 Key 的问题。",
+      "**版本号大不等于便宜或更好**：`qwen3.6-flash` 是 ¥1.2/¥7.2，而更新的 `qwen3.7-flash` 只要 ¥0.2/¥0.8——差 6 倍。同样 `qwen3.8-max` 和 `qwen3.7-max` 价格完全一样（¥12/¥36）。选型要看实际价格表，不要按版本号推断。",
+      "**不需要单独接 VL 模型**。qwen3.7-plus / qwen3.7-flash / qwen3.8-max 都原生支持图像和视频输入，截屏理解直接塞进主对话请求即可。独立的 `qwen3-vl-plus` / `qwen3-vl-flash` 反而视频时长上限更短（1 小时 vs 2 小时），是历史遗留而非升级选项。",
+      "**免费额度是每模型 100 万 token / 90 天**，不是总量共享。听起来多，但音频 token 消耗极快——按 Qwen3.5-Omni 的 7 tokens/秒算，100 万 token 大约只够 40 小时的纯音频输入，而且实际因为上下文重复计费会短得多。别按免费额度做长期规划。",
+      "**声音克隆的音色一年不用会被自动删除**。akari 如果有专属音色，要么定期调用保活，要么把原始样本音频存好以便重建。另外 Qwen-TTS 系列复刻要 ¥0.01/个（前 90 天免费 1000 个），而 Qwen-Audio-TTS / CosyVoice 系列复刻完全免费——选后者。",
+      "**Realtime 里联网搜索和工具调用不能同时开启**。akari 作为个人 agent 助理如果既要控制电脑（function calling）又要查资料（web search），在端到端语音链路里得二选一，或者把搜索也包装成自己的一个 tool。",
+      "**拼装方案的打断逻辑要自己写，而且这是最容易做砸的一块**。云端 VAD 有网络往返，本地 VAD 更快但要自己实现。收到用户开口信号后必须同时做三件事：停 TTS 播放、cancel 正在进行的 TTS WebSocket 请求、abort 正在流式输出的 LLM 请求。任何一环漏掉都会出现\"她还在自说自话\"的破功感。"
+    ]
+  },
+  "qwen-local": {
+    "topic": "akari — Apple Silicon Mac 上本地跑 Qwen + 本地语音（ASR/TTS）的可行性（2026-08 现状）",
+    "summary": "结论先说业务层面：**全本地可行，但\"全本地 + 2560x1440@60fps 写实数字人壁纸\"在同一台机器上是资源竞争关系，不是技术可行性问题**。MLX 跑 LLM 吃 GPU 和内存带宽，你的壁纸渲染也吃 GPU 和内存带宽。真正能落地的架构是「ANE 优先做语音 + GPU 分时做 LLM + 云端兜底复杂推理」，而不是把所有东西都塞进 GPU。\n\n技术现状（2026-08）：Qwen 已经迭代到 **Qwen3.8**（3.8-27B 于 2026-08-14 开源，Apache-2.0，262K 上下文），Qwen3.5/3.6/3.8 全系在 `mlx-community` 有官方 4bit MLX 权重，且 Qwen3.5 起**原生多模态**（Ollama tag 页标注全系 vision+tools+thinking，256K 上下文）。日常对话人设推荐 `mlx-community/Qwen3.5-9B-4bit`（5.95 GB）或 MoE 的 `Qwen3.6-35B-A3B-4bit-DWQ`（M4 Max 级别约 42 tok/s）。运行时有四条路：`mlx-lm`（Python，`mlx_lm.server` 提供 OpenAI 兼容端点，WWDC26 Session 232 官方推荐）、Ollama 0.19（新增 MLX runner，但**要求 >32GB 统一内存**）、LM Studio 0.4.14（MTP 投机解码转正）、以及 Swift 原生的 `mlx-swift-lm`。\n\n语音侧 2026 年变化很大：**Apple 在 macOS 26 就提供了 SpeechAnalyzer/SpeechTranscriber**，supportedLocales 含 `zh_CN / zh_HK / zh_TW / yue_CN`，速度约为 whisper large-v3-turbo 的 2 倍，且完全免费、无需打包模型 —— 这是中文 ASR 的默认选择。TTS 侧 Apple 的 AVSpeechSynthesizer 中文女声\"能用但没有人设\"，要做虚拟女友音色必须上 **Qwen3-TTS-12Hz-0.6B/1.7B**（Apache-2.0，3 秒克隆，mlx-audio 已支持）或 CosyVoice3。Kokoro 虽然快（RTF 0.08）但**中文音色官方评级为 D 且不支持克隆**，不适合本项目。\n\n现实延迟预算（M4 Max，端点检测到首个音节）：Apple 栈约 **0.7–1.2 s**，全 Qwen 栈约 **1.5–2.5 s**。行业公认\"可接受\"线是 600–800 ms，所以纯本地做不到\"云端级丝滑\"，这就是混合方案的理由。\n\n需要诚实说明：网上 2026 年的 tok/s 对比站（llmcheck.net、markaicode、willitrunai 等）大量疑似 AI 批量生成，数字互相打架，我把它们标为 medium/low，落地前必须在目标机器上自测。",
+    "options": [
+      {
+        "name": "LLM-A：mlx-lm + Qwen3.5-9B-4bit（推荐主力）",
+        "how": "`pip install mlx-lm`，模型 `mlx-community/Qwen3.5-9B-4bit`（磁盘 5.95 GB，用 mlx-vlm 0.3.12 转换，含视觉塔）。用 `mlx_lm.server --model mlx-community/Qwen3.5-9B-4bit` 起一个 OpenAI 兼容 HTTP 服务（127.0.0.1:8080/v1/chat/completions），akari 主进程（Swift/Node/Rust 都行）当客户端。WWDC26 Session 232 就是官方推荐的这条路。系统提示词用 prompt cache 常驻，把 TTFT 压到 200–400 ms。",
+        "pros": "权重体积小、内存占用可控（≈7–8 GB 含 KV cache）；OpenAI 兼容协议意味着可以一行配置切到云端；支持 tool calling 和 reasoning，直接满足'personal agent'；Qwen3.5 起原生多模态，未来给 akari 加'看屏幕'能力不用换模型；官方 Apple 背书。",
+        "cons": "需要一个常驻 Python 进程（打包/分发麻烦，得内嵌 venv 或用 uv）；9B dense 在 M1/M2 base 上只有 10–17 tok/s，体验差；GPU 占用会和壁纸渲染抢带宽；256K 上下文不能开满，KV cache 会爆内存。",
+        "maturity": "production-ready",
+        "cost": "$0 授权（Apache-2.0）；工程量：起服务 1 天，进程管理/健康检查/模型下载 UI 约 3–5 天"
+      },
+      {
+        "name": "LLM-B：Ollama 0.19 MLX runner",
+        "how": "安装 Ollama 0.19（Apple Silicon 上新增 MLX 后端预览），`ollama run qwen3.5:9b-mlx` 或 `ollama run qwen3.5:35b-a3b-coding-nvfp4`。Ollama 官方 tag：0.8b(1.0GB)/2b(2.7GB)/4b(3.4GB)/9b(6.6GB)/27b(17GB)/35b(24GB)/122b(81GB)，另有 0.8b-mlx 到 27b-mlx 的 MLX 专用 tag。",
+        "pros": "零 Python 依赖，一个二进制 + 后台服务；模型管理（拉取/切换/量化）开箱即用；同样是 OpenAI 兼容 API；MLX 后端在 M5 上实测 prefill 1810 tok/s、decode 112 tok/s（vs 0.18 的 1154/58）。",
+        "cons": "**MLX runner 明确要求 >32GB 统一内存**，16/24GB 机器只能退回 llama.cpp 后端；预览状态，模型覆盖还不全（NVFP4 只有特定 tag）；Ollama 自己是个系统级服务，和 akari 的生命周期不好绑定；用户得先装 Ollama，对'桌面小应用'的分发体验不友好。",
+        "maturity": "usable",
+        "cost": "$0；工程量：1–2 天（但要处理'用户没装 Ollama'的引导流程）"
+      },
+      {
+        "name": "LLM-C：mlx-swift-lm 原生嵌入 Swift App（分发最干净）",
+        "how": "用 Swift Package `ml-explore/mlx-swift` + `mlx-swift-lm`（原 mlx-swift-examples 的 MLXLLM/MLXVLM/MLXLMCommon 模块）。API 形如 `let model = try await loadModel(id: \"mlx-community/Qwen3.5-4B-MLX-4bit\")`，模型从 HF 首次运行时下载到 App Support 目录。",
+        "pros": "单一 .app，无 Python、无外部服务，最适合'桌面驻留小助手'的分发形态；和 SwiftUI/Metal 壁纸渲染同进程，可以统一调度 GPU 资源、必要时主动降频让位给渲染；内存生命周期可控。",
+        "cons": "Swift 侧的模型架构支持永远滞后 Python 的 mlx-lm 几周到几个月（Qwen3.8 这种新架构可能要等）；调试工具链弱；需要处理 Xcode entitlements 与内存上限（`com.apple.developer.kernel.increased-memory-limit`）；生态示例少。",
+        "maturity": "usable",
+        "cost": "$0；工程量：5–10 天（模型下载 UI、内存管理、流式输出接线）"
+      },
+      {
+        "name": "LLM-D：Apple Foundation Models（做路由/轻任务，不做主力）",
+        "how": "macOS 26 起 `import FoundationModels`，`LanguageModelSession` + `@Generable` 宏做结构化输出（guided generation）+ `Tool` 协议做函数调用。跑在 ANE 上，约 3B 参数。macOS 27（WWDC26 发布，现 beta）新增 `LanguageModel` 抽象协议、`CoreAILanguageModel`、`MLXLanguageModel`、Private Cloud Compute（32K 上下文 + reasoning level: light/medium/deep）、视觉输入、`contextSize` = 8192、`fm` 命令行工具、Python SDK，且框架核心将开源。",
+        "pros": "零下载、零内存额外开销（系统共享）、零成本、跑 ANE 不抢 GPU —— 这一点对 akari 的壁纸渲染极其关键；tool calling 和结构化输出是一等公民，做'意图路由 + 槽位抽取'非常合适；macOS 27 后能用同一套 `LanguageModelSession` 代码同时挂 Apple 模型 / MLX 本地模型 / Anthropic / Google。",
+        "cons": "**macOS 26.6 上还是老的 3B 模型、上下文约 4K**，Apple 明确不建议用于代码生成、数学计算、事实问答；中文生成质量明显弱于 Qwen3.5-9B，做不了'有人设的女友对话'；MLXLanguageModel / PCC / vision 全部要 macOS 27（约 2026 年 9 月正式发布）；每次 OS 更新换模型版本，自训 adapter 要重训。",
+        "maturity": "production-ready（作为路由层）/ experimental（作为主力对话）",
+        "cost": "$0（PCC 对首次下载 <200 万的开发者免费）；工程量：2–3 天"
+      },
+      {
+        "name": "LLM-E：混合路由（本地小模型分诊 + 云端 Qwen3.6-Plus 兜底）——推荐最终形态",
+        "how": "三层规则：(1) 意图路由用 Apple Foundation Models 或 Qwen3.5-0.8B/2B-4bit 做零成本分类（闲聊 / 控制电脑 / 需要联网或复杂推理）；(2) 闲聊和电脑控制走本地 Qwen3.5-9B；(3) 复杂推理/长上下文走 DashScope 的 qwen3.6-plus（$0.325/M 输入、$1.95/M 输出，cache read 仅 $0.0325/M）。因为本地和云端都是 OpenAI 兼容协议，路由层只是换 baseURL。参考实现：vllm-project/semantic-router（v0.3 Themis）、RouteLLM（矩阵分解 / BERT 分类器 / cos 相似度 / LLM-as-judge 四种 router）。",
+        "pros": "业界已验证：混合方案可在保持准确率的同时减少 60%+ 云端调用、降低约 40% 平均延迟；隐私敏感内容（akari 会看到用户桌面）天然留在本地；成本可预测且极低；GPU 峰值压力下降，壁纸渲染不掉帧。",
+        "cons": "路由本身是一层延迟（Apple FM 分类约 100–200 ms）和一个新的错误来源（路由错了体验很差）；两套模型的人设/口吻要对齐，否则用户能感觉到'换了个人'；需要处理离线降级；vLLM semantic-router 是 K8s-native 的，Mac 上要自己写轻量版（规则路由就够了，别上 ML 路由）。",
+        "maturity": "production-ready（规则路由）/ usable（语义路由）",
+        "cost": "云端约 $1–5/月（个人使用量）；工程量：规则路由 2–3 天，加缓存和降级 1 周"
+      },
+      {
+        "name": "ASR-A：Apple SpeechAnalyzer / SpeechTranscriber（中文首选）",
+        "how": "macOS 26+ 的 Speech 框架新 API。`SpeechAnalyzer` 管会话，`SpeechTranscriber(locale:)` 做转写，配合 `AVAudioEngine` 流式喂音频，或 `analyzeSequence(from:)` 处理文件。模型通过 `AssetInventory` 按语种下载。`SpeechTranscriber.supportedLocales` 实测包含 zh_CN、zh_HK、zh_TW、yue_CN（共 42 个 locale）。可中途自动适应语种切换。",
+        "pros": "中文（普通话+粤语）原生支持，零模型打包、零额外内存、跑系统进程不抢 akari 的 GPU；流式转写意味着用户说话时就在出字，端点后只需 100–250 ms 定稿；基准测试约为 whisper large-v3-turbo 的 2 倍速度，英文 WER 2.12%（vs Whisper Small 3.74%）；Apple 自家 Notes/Voice Memos 在用，稳定性有保障。",
+        "cons": "闭源黑盒，中文 WER 没有权威第三方数字（我只找到英文对比，标 low）；`supportedLocales` 在模拟器或资源未安装时返回空数组，首次使用有模型下载等待需要做 UI；无法微调、无法加自定义词表（akari 这种带专有名词的人设可能识别不准）；锁死 macOS 26+。",
+        "maturity": "production-ready",
+        "cost": "$0；工程量：2–3 天（含权限、资源下载、端点检测接线）"
+      },
+      {
+        "name": "ASR-B：Qwen3-ASR-0.6B / 1.7B on MLX（要可控性时用）",
+        "how": "官方仓库 QwenLM/Qwen3-ASR，权重 `Qwen/Qwen3-ASR-0.6B`、`Qwen/Qwen3-ASR-1.7B`（另有 -hf 变体和 `Qwen3-ForcedAligner-0.6B`），2026-01-29 开源。Mac 上三条路：`pip install mlx-audio`（内置 Qwen3-ASR + 强制对齐）、`pip install qwen3-asr-mlx`（moona3k/mlx-qwen3-asr）、或 Swift 的 `speech-swift`（soniqo，Apache-2.0，macOS 15+）。支持 30 种语言 + 22 种中文方言，流式/离线统一推理，支持时间戳预测。",
+        "pros": "和对话 LLM 同源，术语/人设词表可以通过 prompt 注入偏置；中文方言覆盖极好（22 种）；开源可控可微调；能拿到词级时间戳，做口型同步（lip-sync）时非常有用 —— 这对 akari 的数字人嘴型驱动是刚需；1.7B 号称开源 SOTA。",
+        "cons": "0.6B 也要额外 ~1.2 GB 内存 + GPU 算力，和壁纸渲染 + LLM 三方抢资源；MLX 移植是社区维护（moona3k / soniqo），不是 Qwen 官方，版本跟进有风险；实测 RTF 数字我只找到间接引用（speech-swift 给出 Voxtral Mini 3B 在 M5 Pro 是 0.074 RTF，Qwen3-ASR 没给），标 medium。",
+        "maturity": "usable",
+        "cost": "$0（Apache-2.0）；工程量：Python 路线 2 天，Swift 路线 4–5 天"
+      },
+      {
+        "name": "ASR-C：whisper.cpp / SenseVoice / Parakeet（备选，各有硬伤）",
+        "how": "whisper.cpp：`ggml-large-v3-turbo.bin` + Metal 后端，另可把 encoder 编译成 Core ML 跑 ANE（官方称比纯 CPU 快 3 倍以上）。SenseVoice Small：中日韩粤最快，MLX 版实测 27 分钟中文播客 13.83 秒（≈117x 实时）。Parakeet：通过 Swift SDK `FluidInference/FluidAudio`（CoreML/ANE，macOS 14+/iOS 17+，含 Silero VAD + pyannote/Sortformer 说话人分离）。",
+        "pros": "whisper.cpp 无依赖、跨平台、生态最成熟；SenseVoice 是中文场景速度冠军且带情感/事件标签；FluidAudio 是唯一纯 Swift + 纯 ANE 的完整音频栈（VAD + ASR + 分离 + TTS），完全不碰 GPU，对 akari 的渲染友好度最高。",
+        "cons": "**FluidAudio 的 ASR 主力 Parakeet TDT v3 只支持 25 种欧洲语言，不支持中文** —— 这是最大的坑，很多人以为它能用；whisper large-v3 在 M3/M4 上只有约 2–3x 实时，做实时对话端点延迟偏高；SenseVoice 无标点/无时间戳的老问题需要额外后处理，且 MLX 移植是社区的。",
+        "maturity": "production-ready（whisper.cpp）/ usable（SenseVoice、FluidAudio 的 VAD 部分）",
+        "cost": "$0；工程量：whisper.cpp 2 天，SenseVoice 3 天"
+      },
+      {
+        "name": "TTS-A：Qwen3-TTS-12Hz on MLX（虚拟女友音色首选）",
+        "how": "官方 QwenLM/Qwen3-TTS，Apache-2.0，2026-01 开源。型号：`Qwen3-TTS-12Hz-1.7B-{Base,CustomVoice,VoiceDesign}` 和 `Qwen3-TTS-12Hz-0.6B-{Base,CustomVoice}`，另有 `Qwen3-TTS-Tokenizer-12Hz`。pip 包 `qwen-tts`（约 3.9 GB）。Mac 路线：`pip install mlx-audio` 后用 `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit` 等 8bit 量化；或 kapi2800/qwen3-tts-apple-silicon、suckerfish/qwen3-tts-mlx。支持中英日韩德法俄葡西意 10 语种。",
+        "pros": "**3 秒参考音频即可克隆音色** —— 这是做固定人设最关键的能力，Kokoro 做不到；VoiceDesign 版能用自然语言描述音色（'温柔的年轻女声，语速偏慢'），非常适合 akari 的'换装/换人设'；带情感、语调、韵律控制；官方支持流式，宣称端到端 97 ms；纯 Apache-2.0 可商用。",
+        "cons": "**97 ms 是 CUDA + 官方流式框架的数字，Mac 上 mlx-audio 目前以非流式为主**，实测 M2 Mac mini 约 1000 字/分钟（≈16 字/秒，中文语速约 5 字/秒，RTF≈0.3），首包延迟需要自己切句实现；mlx-audio 有已知 bug：非克隆模式下 `split_pattern` 被忽略，长文本要手动切块；1.7B 又是 ~2 GB 内存 + GPU 占用。",
+        "maturity": "usable",
+        "cost": "$0；工程量：跑通 1 天，做流式切句 + 首包优化 3–5 天"
+      },
+      {
+        "name": "TTS-B：Kokoro-82M（低延迟备选，但中文是短板）",
+        "how": "82M 参数，Apache-2.0，54 个音色 / 10 语种。Mac 三条路：mlx-audio 内置、`gabrimatic/kokoro-mlx`（MLX）、`mattmireles/kokoro-coreml`（CoreML/ANE）、`mlalma/kokoro-ios`（Swift）。中文音色 id：zf_xiaobei、zf_xiaoni、zf_xiaoxiao、zf_xiaoyi（女）、zm_yunxi 等（男）。",
+        "pros": "极快：CoreML 版在 Mac Studio 上 379 ms 生成 30 秒语音（12–79x 实时，跑 ANE 不占 GPU）；speech-swift 测 iPhone 16 Pro 上 RTF 0.08；82M 权重只占几百 MB；有成熟的 Swift/CoreML 移植，可以直接进 .app。",
+        "cons": "**中文音色在官方音色评级表里全是 D 级**（英美音色才有 A/B 级），听感明显是'外国人说中文'的机械感，做虚拟女友人设不合格；**不支持声音克隆**，只能用预置音色，'换装换人设'时音色无法跟着变；不支持情感控制。",
+        "maturity": "production-ready（技术上）/ dead-end（就中文人设需求而言）",
+        "cost": "$0；工程量：CoreML 路线 2 天"
+      },
+      {
+        "name": "TTS-C：CosyVoice3 / GPT-SoVITS / F5-TTS（高质量克隆备选）",
+        "how": "CosyVoice：阿里开源，支持离线+流式，收到 5 个字后约 150 ms 出音，带情感标签、9 语种；Swift 侧 speech-swift 已集成 CosyVoice3。GPT-SoVITS：RVC-Boss 团队，GitHub 58k+ star，支持中英日韩粤 5 语种，**1 分钟训练音频可达约 90% 音色相似度**，官方支持 macOS 12.3+ Apple Silicon，有免 Python 环境的 Mac 整合包。F5-TTS：零样本克隆，mlx-audio 已支持。",
+        "pros": "GPT-SoVITS 的中文音色相似度是这批里最高的（需要微调，不是零样本）；CosyVoice 流式 150 ms 首包，是延迟最优的克隆方案；都是中文社区重点维护，中文语料充足。",
+        "cons": "GPT-SoVITS 需要训练步骤（几十分钟 GPU 时间），不是'塞 3 秒音频就走'，且 Mac 上走 MPS 而非 MLX，速度和稳定性都不如原生 MLX；CosyVoice 官方主要针对 CUDA，Mac 支持靠 speech-swift 这类第三方；依赖链重（PyTorch + MPS），打包进桌面 App 非常痛苦。",
+        "maturity": "usable（Linux/CUDA 上 production-ready，Mac 上 usable）",
+        "cost": "$0；工程量：GPT-SoVITS 训练+接线 1 周；CosyVoice via speech-swift 3–4 天"
+      },
+      {
+        "name": "架构-F：ANE 优先分层（针对 akari 壁纸渲染的关键设计）",
+        "how": "把语音链路全部推到 ANE / 系统进程，GPU 只留给 Metal 壁纸渲染 + LLM 分时使用：VAD 用 Silero（FluidAudio，ANE）→ ASR 用 Apple SpeechAnalyzer（系统进程）→ 意图路由用 Apple Foundation Models（ANE）→ 对话 LLM 用 MLX（GPU，仅在需要时唤醒）→ TTS 用 Kokoro CoreML（ANE）做即时短应答 + Qwen3-TTS（GPU）做人设长句。壁纸渲染在 LLM 推理期间主动降到 30fps 或切静态帧。",
+        "pros": "这是唯一能让 60fps 写实渲染和本地 LLM 共存的架构；ANE 组件功耗极低，适合'桌面常驻'（笔记本电池友好）；GPU 争用只发生在明确的对话窗口内，用户能接受那一两秒的微动作变慢。",
+        "cons": "两套 TTS 意味着两种音色，需要设计成'短语气词用 Kokoro、正文用 Qwen3-TTS'才不违和，或者干脆都用 Qwen3-TTS 接受延迟；ANE 无法被应用直接调度优先级，Apple 不提供 QoS 控制；工程复杂度显著上升；我没有找到直接测量'MLX 推理 + 60fps Metal 渲染并发'的公开数据，这一条是基于统一内存带宽共享的推断。",
+        "maturity": "experimental",
+        "cost": "$0 授权；工程量：整体集成 3–4 周"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "mlx-community/Qwen3.5-9B-4bit：磁盘 5.95 GB，4-bit（BF16/U32/F32 张量），由 mlx-vlm 0.3.12 转换（即含视觉能力）。安装 `pip install -U mlx-vlm`。",
+        "confidence": "high",
+        "source_url": "https://huggingface.co/mlx-community/Qwen3.5-9B-4bit"
+      },
+      {
+        "fact": "mlx-community 上已有的 Qwen MLX 仓库（确切名）：Qwen3.5-0.8B-MLX-4bit、Qwen3.5-2B-OptiQ-4bit、Qwen3.5-4B-MLX-4bit、Qwen3.5-9B-4bit、Qwen3.5-9B-MLX-4bit、Qwen3.5-9B-MTP-4bit、Qwen3.5-9B-OptiQ-4bit、Qwen3.5-35B-A3B-4bit、Qwen3.6-27B-OptiQ-4bit、Qwen3.6-35B-A3B-4bit-DWQ、Qwen3.6-35B-A3B-MTP-4bit、Qwen3.8-27B-4bit、Qwen3.8-27B-MTP-4bit、Qwen3.8-27B-OptiQ-4bit。lmstudio-community 另有 Qwen3.6-35B-A3B-MLX-4bit、Qwen3.8-27B-MLX-4bit。",
+        "confidence": "high",
+        "source_url": "https://huggingface.co/mlx-community"
+      },
+      {
+        "fact": "mlx-community/Qwen3.8-27B-4bit：16.1 GB，4-bit MLX，image+text 多模态。OptiQ 变体为逐层混合精度（按 KL 散度敏感度分析，敏感层 8-bit、鲁棒层 4-bit，视觉塔保持 bf16）。MTP 变体是给 mlx-vlm 投机解码用的 drafter 权重。",
+        "confidence": "medium",
+        "source_url": "https://huggingface.co/mlx-community/Qwen3.8-27B-4bit"
+      },
+      {
+        "fact": "Qwen3.8-27B 于 2026-08-14 开源，Apache-2.0，上下文 262,144 tokens；Qwen3.8-2.4T-A95B（MoE，约 2.4T 总参 / 95B 激活）于 2026-08-12 开源。截至 2026-08-19 这是 Qwen 最新的开源系列。",
+        "confidence": "medium",
+        "source_url": "https://github.com/QwenLM/Qwen3.8"
+      },
+      {
+        "fact": "Qwen 版本时间线：Qwen3.5 于 2026-02-16 发布；中型系列（27B dense / 35B-A3B / 122B-A10B）2026-02-24；小型系列（0.8B/2B/4B/9B）2026-03-02。Qwen3.6-35B-A3B 2026-04-16、Qwen3.6-Max-Preview 2026-04-20、Qwen3.6-27B 2026-04-22。",
+        "confidence": "medium",
+        "source_url": "https://modelfit.io/blog/qwen-35-medium-series/"
+      },
+      {
+        "fact": "Ollama library qwen3.5 官方 tag 与体积：0.8b=1.0GB、2b=2.7GB、4b=3.4GB、9b=6.6GB（=latest）、27b=17GB、35b=24GB、122b=81GB；全部 256K 上下文，能力标注 vision + tools + thinking + cloud。另有 0.8b-mlx 到 27b-mlx 的 MLX 专用 tag（1.2GB–20GB），以及 qwen3.5:cloud、qwen3.5:397b-cloud。",
+        "confidence": "high",
+        "source_url": "https://ollama.com/library/qwen3.5"
+      },
+      {
+        "fact": "Ollama 0.19 在 Apple Silicon 上启用 MLX 后端（预览）。M5 上 qwen3.5:35b-a3b-coding-nvfp4 实测：prefill 1,810 tok/s（0.18 版为 1,154），decode 112 tok/s（0.18 版为 58）。**要求 Mac 统一内存 >32GB**。",
+        "confidence": "high",
+        "source_url": "https://ollama.com/blog/mlx"
+      },
+      {
+        "fact": "WWDC26 Session 232 官方推荐的本地 agent 栈：`pip install mlx-lm` → `mlx_lm.server --model mlx-community/Qwen-3.5-4B-8bit` → 任何支持 OpenAI chat completions 的 agent 框架接 http://127.0.0.1:8080/v1。支持 continuous batching、tool calling、reasoning 模型。分布式：`mlx.launch --hostfile hosts.json --backend jaccl`，4 节点最多 3x 加速，Thunderbolt RDMA 需 macOS 26.2+。M5 神经加速器矩阵乘比 M4 快 4 倍（主要利好 prefill）。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2026/232/"
+      },
+      {
+        "fact": "Apple SpeechTranscriber.supportedLocales 实测返回 42 个 locale，含 zh_CN、zh_HK、zh_TW、yue_CN（粤语），以及 ja_JP、ko_KR、en_* 等。SpeechTranscriber(locale:) 接受初始 locale，模型可自动适应流中语种切换。",
+        "confidence": "medium",
+        "source_url": "https://medium.com/@itsuki.enjoy/swift-speechtranscriber-support-multi-language-without-manual-locale-switching-b626b547bd74"
+      },
+      {
+        "fact": "SpeechAnalyzer / SpeechTranscriber 是 macOS 26 / iOS 26 引入的新 API（WWDC25 Session 277），SpeechAnalyzer 管理分析会话、SpeechTranscriber 做转写；文件转写用 AVAudioFile + analyzeSequence(from:)。取代旧的 SFSpeechRecognizer。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2025/277/"
+      },
+      {
+        "fact": "SpeechAnalyzer 基准：约为 Whisper large-v3-turbo 的 2 倍速度；清晰语音英文 WER 2.12%（Whisper Small 为 3.74%），处理速度约 3 倍。中文 WER 无权威第三方数据。",
+        "confidence": "low",
+        "source_url": "https://finance.biggo.com/news/cd1c4c76-2545-435d-9c05-9e6b9ec88f5d"
+      },
+      {
+        "fact": "Apple Foundation Models（macOS 26+）：约 3B 端上模型，跑 ANE；@Generable 宏做 guided generation（约束解码），Tool 协议做类型化函数调用。Apple 明确不建议用于代码生成、数学计算、事实型问答。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2026/241/"
+      },
+      {
+        "fact": "WWDC26（macOS 27）Foundation Models 新增：重建的端上模型（上下文 8,192 tokens，支持图像输入）、Private Cloud Compute 模型（32,000 上下文，reasoning level 可设 light/medium/deep，开发者首次下载 <200 万免费）、LanguageModel 抽象协议 + CoreAILanguageModel（ANE/GPU 跑本地模型）+ MLXLanguageModel（Mac GPU 跑任意 MLX 模型）、Anthropic 与 Google 将发布符合协议的 Swift 包、BarcodeReaderTool / OCRTool / Spotlight Search Tool（本地 RAG）、DynamicProfile（单 session 内动态切模型/指令/工具）、macOS 27 的 `fm` CLI、Python SDK、框架核心开源。token 计数 API（model.contextSize、model.tokenCount(for:)）从 iOS 26.4+ 起可用。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2026/241/"
+      },
+      {
+        "fact": "Qwen3-TTS（QwenLM/Qwen3-TTS，Apache-2.0，2026-01 开源）：Qwen3-TTS-12Hz-1.7B-{Base,CustomVoice,VoiceDesign}、Qwen3-TTS-12Hz-0.6B-{Base,CustomVoice}、Qwen3-TTS-Tokenizer-12Hz。pip 包名 `qwen-tts`（约 3.9GB 权重）。10 语种（中英日韩德法俄葡西意）。3 秒参考音频 + 转录即可克隆；CustomVoice 版含 9 个预置音色。全系支持流式，官方宣称端到端合成延迟低至 97 ms（CUDA）。README 未提及 Apple Silicon/MLX 支持。",
+        "confidence": "high",
+        "source_url": "https://github.com/QwenLM/Qwen3-TTS"
+      },
+      {
+        "fact": "Qwen3-TTS 在 macOS 上通过 mlx-audio 实测：M2 Mac mini，模型 mlx-community/Qwen3-TTS-12Hz-1.7B-{VoiceDesign,CustomVoice,Base}-8bit，生成速度约 1,000 字符/分钟。已知 bug：非语音克隆模式下 split_pattern 选项被忽略，长文本需手动切块。环境：Homebrew Python 3.14.2 + ffmpeg + `pip install mlx_audio`。",
+        "confidence": "medium",
+        "source_url": "https://mybyways.com/blog/qwen3-tts-with-mlx-audio-on-macos"
+      },
+      {
+        "fact": "Qwen3-ASR（QwenLM/Qwen3-ASR）：Qwen/Qwen3-ASR-0.6B、Qwen/Qwen3-ASR-1.7B（另有 -hf 变体）与 Qwen3-ForcedAligner-0.6B，2026-01-29 开源。支持 30 种语言 + 22 种中文方言 + 多国英语口音的语种识别与转写，单模型流式/离线统一推理，支持长音频与时间戳预测。1.7B 为开源 ASR SOTA。",
+        "confidence": "high",
+        "source_url": "https://github.com/QwenLM/Qwen3-ASR"
+      },
+      {
+        "fact": "mlx-audio（`pip install mlx-audio`，Blaizzy/mlx-audio）：TTS 支持 Kokoro（54 音色，含中文）、Qwen3-TTS、OmniVoice（646+ 语种零样本克隆）、F5-TTS、Dia、CSM/MisoTTS、Voxtral TTS、Ming Omni TTS、LongCat-AudioDiT、KugelAudio；STT 支持 Whisper、Qwen3-ASR（含强制对齐）、VibeVoice-ASR（9B 带说话人分离）、Parakeet、Voxtral Realtime。README 未给出 RTF 基准。",
+        "confidence": "high",
+        "source_url": "https://github.com/Blaizzy/mlx-audio"
+      },
+      {
+        "fact": "Swift 侧完整语音栈 soniqo/speech-swift（Apache-2.0，Swift 6+/Xcode 16+，macOS 15+ 或 iOS 18+，Apple Silicon）：ASR 含 Qwen3-ASR 0.6B/1.7B、Whisper Large-v3 Turbo(CoreML)、Parakeet TDT 0.6B、Omnilingual ASR、Nemotron Streaming、Cohere Transcribe 2B；TTS 含 Qwen3-TTS 0.6B/1.7B（流式+克隆）、Kokoro-82M、CosyVoice3、VoxCPM2、F5-TTS、IndexTTS2、Higgs TTS 3、OmniVoice；VAD/分离含 Silero VAD、Pyannote、Sortformer；S2S 含 PersonaPlex 7B。实测 RTF：Kokoro on iPhone 16 Pro 0.08、Parakeet EOU 120M 0.04、Omnilingual 300M 0.28、Voxtral Mini 3B on M5 Pro 0.074、PersonaPlex 7B on M2 Max ≈0.94。",
+        "confidence": "medium",
+        "source_url": "https://github.com/soniqo/speech-swift"
+      },
+      {
+        "fact": "FluidInference/FluidAudio（Swift SDK，macOS 14+/iOS 17+，CoreML 跑 ANE 不用 GPU/MPS）：ASR 用 Parakeet TDT v3 (0.6b) —— **仅支持 25 种欧洲语言，不含中文**；说话人分离用 Pyannote；VAD 用 Silero。可通过 SwiftPM 或 CocoaPods 引入。",
+        "confidence": "high",
+        "source_url": "https://github.com/FluidInference/FluidAudio"
+      },
+      {
+        "fact": "Kokoro-82M 中文女声 zf_xiaobei、zf_xiaoni、zf_xiaoxiao、zf_xiaoyi 在官方音色评级中均为 D 级；Kokoro 只提供预置音色，不支持从录音克隆。Apache-2.0，54 音色/10 语种。",
+        "confidence": "medium",
+        "source_url": "https://soniqo.audio/guides/kokoro"
+      },
+      {
+        "fact": "Kokoro CoreML 移植（mattmireles/kokoro-coreml）：Mac Studio 上 379 ms 生成 30 秒语音，比同硬件 MLX 快 2 倍，跑 Apple Neural Engine，达 12–79x 实时。",
+        "confidence": "medium",
+        "source_url": "https://huggingface.co/mattmireles/kokoro-coreml"
+      },
+      {
+        "fact": "CosyVoice 2.0 支持离线与流式合成，收到约 5 个字符后约 150 ms 首包延迟；支持语音克隆、多说话人对话、情感标签，9 语种。",
+        "confidence": "medium",
+        "source_url": "https://blog.csdn.net/u010522887/article/details/144899524"
+      },
+      {
+        "fact": "GPT-SoVITS（RVC-Boss）：GitHub 58k+ star（2026），支持中/英/日/韩/粤 5 语种，约 1 分钟训练音频可达约 90% 音色相似度；官方支持 macOS 12.3+ Apple Silicon，有免 Python 环境的 Mac 整合包（走 MPS 非 MLX）。",
+        "confidence": "medium",
+        "source_url": "https://magicnetworld.com/tools/gpt-sovits/"
+      },
+      {
+        "fact": "SenseVoice Small 在 MLX 上：27 分钟中文播客 13.83 秒完成（原需 3 分 44 秒），约为 Parakeet V3 速度的一半。Mac 上推荐分工：英语/欧语用 Parakeet V3，中日韩粤用 SenseVoice，其余用 Whisper Large-v3 Turbo。",
+        "confidence": "medium",
+        "source_url": "https://whispernotes.app/blog/sensevoice-fastest-cjk-transcription"
+      },
+      {
+        "fact": "whisper.cpp 在 Mac 上可把 encoder 编译为 Core ML 跑 ANE，官方称比纯 CPU 快 3 倍以上；Metal 后端对 large-v3-turbo 普遍 2 倍以上加速。实际吞吐 large-v3 在 M3/M4 约 2–3x 实时，M5 Pro 上 whisper.cpp+Metal 约 10x 实时。",
+        "confidence": "medium",
+        "source_url": "https://fazm.ai/blog/whisper-cpp-metal-apple-silicon"
+      },
+      {
+        "fact": "行业语音 agent 延迟预算（经典 STT→LLM→TTS 管线）：从用户说完到首个音频输出约 600 ms 为调优良好水平。拆分：网络 30–80 ms、VAD/轮次切换 150–300 ms、LLM TTFT 150–400 ms、TTS 首音 100–200 ms。超过 1 秒用户会察觉，超过 2 秒会以为断线。端到端语音模型（S2S）可再省 100–200 ms。对照：Whisper-large-v3 + Qwen3-8B 管线在 H100 上 p90 TTFT 约 800 ms，而 Qwen2.5-Omni 7B 约 40 ms。",
+        "confidence": "medium",
+        "source_url": "https://thepromptbench.com/voice-and-realtime/latency-budgets-for-realtime-voice/"
+      },
+      {
+        "fact": "Apple Silicon Qwen tok/s 参考（llmcheck.net 2026-08 数据集，第三方聚合，仅供量级参考）：Qwen3.5-9B —— M1/16GB(Ollama) 10 tok/s、M3/16GB(Ollama) 15、M4/16GB(LM Studio) 18、M4 Pro/24GB(MLX) 40、M5 Max(MLX) 82，TTFT 0.4–1.1s。Qwen3.5-4B —— M4/16GB 40 tok/s、M5 Max 161 tok/s。Qwen3.6-35B-A3B —— M2 Max/64GB(MLX) 24、M4 Pro/24GB(Ollama) 32、M4 Max/48GB(MLX) 42、M5 Max/128GB(MLX) 55。Qwen3.6-27B —— M2 Max/32GB(MLX) 20、M4 Max/64GB(MLX) 27、M5 Max(MLX) 30。",
+        "confidence": "low",
+        "source_url": "https://llmcheck.net/benchmarks"
+      },
+      {
+        "fact": "Qwen3.6-Plus 云端定价（阿里云 DashScope 官方）：输入 $0.325/百万 tokens，输出 $1.95/百万 tokens，Cache 写入 $0.4063/M，Cache 读取 $0.0325/M。折合约 ¥2/百万输入 tokens（≤32K 上下文）。第三方网关（如 OpenRouter/ofox）约 $0.50/$3.00 per M。",
+        "confidence": "medium",
+        "source_url": "https://openrouter.ai/qwen/qwen3.6-plus"
+      },
+      {
+        "fact": "LM Studio 0.4.14 将 MTP（多 token 预测）投机解码转为 stable，Apple Silicon 上封装原生 MLX 引擎。已知限制：批处理 MLX 模型不支持投机解码；Qwen3.5 dense 模型不能作为 Qwen3.5 MoE 的 draft model。",
+        "confidence": "medium",
+        "source_url": "https://github.com/lmstudio-ai/mlx-engine/issues/269"
+      },
+      {
+        "fact": "混合（本地+云端）LLM 路由的公开效果：可在匹配 SOTA 准确率的同时把云端 API 调用减少 60%+、平均延迟降低约 40%。可用实现：vllm-project/semantic-router（v0.1 Iris 2026-01 首个生产就绪版，v0.3 Themis 2026-06，K8s-native）；RouteLLM 提供矩阵分解、BERT 分类器、余弦相似度、LLM-as-judge 四种 router。",
+        "confidence": "medium",
+        "source_url": "https://www.sitepoint.com/hybrid-cloudlocal-llm-the-complete-architecture-guide-2026/"
+      },
+      {
+        "fact": "Swift 原生 MLX：ml-explore/mlx-swift（Swift API for MLX）+ mlx-swift-lm / mlx-swift-examples 提供 MLXLLM、MLXVLM、MLXLMCommon、MLXEmbedders、StableDiffusion 等 SwiftPM 模块，API 形如 `let model = try await loadModel(id: \"mlx-community/Qwen3-4B-4bit\")`。",
+        "confidence": "high",
+        "source_url": "https://github.com/ml-explore/mlx-swift"
+      },
+      {
+        "fact": "唤醒词方案：openWakeWord（dscripka/openWakeWord，内置 Silero VAD，可设 vad_threshold 降低误唤醒，部分测试集上准确率优于 Picovoice Porcupine）；Porcupine 支持 macOS，Raspberry Pi 3 上约 3.8% CPU 占用。两者均需自训中文唤醒词模型，无现成'akari'唤醒词。",
+        "confidence": "medium",
+        "source_url": "https://github.com/dscripka/openWakeWord"
+      }
+    ],
+    "gotchas": [
+      "**最大的坑不是模型跑不动，是 GPU 抢资源。** 你的参考效果是 2560x1440@60fps 写实数字人渲染，这本身就吃满 Metal 和统一内存带宽；MLX 的 LLM 推理也是纯 GPU + 带宽受限。两者并发时会互相拖慢（LLM 掉 tok/s，壁纸掉帧）。我没有找到直接测量这个并发场景的公开数据（标 low），但从统一内存架构推断这是必然的。设计上必须把语音链路推到 ANE（SpeechAnalyzer / Kokoro CoreML / FluidAudio），并在 LLM 推理窗口内主动把渲染降到 30fps。",
+      "**macOS 26.6 ≠ macOS 27。** WWDC26 公布的 Foundation Models 新能力（MLXLanguageModel、CoreAILanguageModel、Private Cloud Compute 32K 上下文、视觉输入、8192 上下文、fm CLI、Python SDK、框架开源）**全部需要 macOS 27**，现在是 beta，预计 2026 年 9 月正式发布。你当前的 26.6 上只有旧的约 3B 端上模型、上下文约 4K。按 WWDC26 的 API 写代码会在 26.6 上编译不过。",
+      "**Ollama 的 MLX 后端要求 Mac 统一内存 >32GB。** 16GB/24GB 的机器装了 Ollama 0.19 也只会回落到 llama.cpp 后端，拿不到那个 112 tok/s 的数字。如果目标用户机型不定，别把 Ollama MLX 当默认路径。",
+      "**FluidAudio 的 ASR 不支持中文。** 它主推的 Parakeet TDT v3 (0.6b) 只覆盖 25 种欧洲语言。很多 2026 年的 Mac 语音文章推荐 FluidAudio 时不提这点。它的 Silero VAD 和 Sortformer 说话人分离仍然值得用（纯 ANE），但 ASR 必须换成 Apple SpeechTranscriber 或 Qwen3-ASR/SenseVoice。",
+      "**Kokoro 的中文音色官方评级是 D 级，且完全不支持声音克隆。** 它在英文场景的好口碑不能迁移到中文。做'有固定人设、可换装换音色的虚拟女友'，Kokoro 是死路——必须上 Qwen3-TTS（3 秒克隆）或 GPT-SoVITS（1 分钟微调，约 90% 相似度）。",
+      "**Qwen3-TTS 官方宣称的 97ms 端到端延迟是 CUDA + 官方流式框架的数字，不是 Mac 上的数字。** mlx-audio 上的 Qwen3-TTS 目前以非流式为主，实测 M2 Mac mini 约 1000 字符/分钟。要做到低首包延迟必须自己按标点切句、逐句合成、边合成边播。另外 mlx-audio 有已知 bug：非克隆模式下 `split_pattern` 参数被忽略，长文本要手动切块。",
+      "**Qwen3-TTS / Qwen3-ASR 的 MLX 移植都不是 Qwen 官方维护的。** mlx-audio（Blaizzy）、qwen3-asr-mlx（moona3k）、qwen3-tts-mlx（suckerfish）、speech-swift（soniqo）都是社区项目。Qwen 出新版本时这些移植可能滞后数周，而且 API 会 breaking change。别把它们放进不可替换的位置。",
+      "**SpeechTranscriber 的模型要通过 AssetInventory 按语种下载**，首次使用有等待时间需要做 UI；`supportedLocales` 在模拟器或资源未安装时会返回空数组（有人踩过这个坑误以为不支持某语种）。另外它是闭源黑盒，无法加自定义词表——akari 这种带专有名词/人设昵称的场景可能识别不准，需要在 LLM 侧做纠错后处理。",
+      "**网上 2026 年的 Apple Silicon tok/s 对比站大量疑似 AI 批量生成，数字互相矛盾。** 例如 llmcheck.net 上 M5 Max 64GB 和 128GB 跑 Qwen3.5-9B 都是 82 tok/s / TTFT 0.5s（明显是模板填充），markaicode 同时声称'M4 Max 38 tok/s'又说'无独立验证数据'。我把这类全部标为 low/medium。**落地前必须在你自己的目标机器上跑 `mlx_lm.benchmark`**，这是唯一能settle的办法。",
+      "**内存预算算不过来会直接 OOM。** 全本地栈同时驻留：Qwen3.5-9B-4bit 权重 ~6GB + KV cache（256K 上下文千万别开满，按 8K–16K 配）+ Qwen3-ASR-0.6B ~1.2GB + Qwen3-TTS-1.7B-8bit ~2GB + 壁纸渲染纹理/帧缓冲若干 GB。16GB Mac 基本做不了全本地；建议 ≥32GB，舒适区 48–64GB。Swift App 还需要申请 `com.apple.developer.kernel.increased-memory-limit` entitlement 才能突破默认内存上限。",
+      "**LM Studio 的投机解码有具体限制**：批处理 MLX 模型不支持投机解码；Qwen3.5 dense 不能当 Qwen3.5 MoE 的 draft model（必须用配套的 `-MTP-4bit` drafter 权重）。想靠投机解码提速前先确认你的组合在支持列表里。",
+      "**唤醒词没有现成中文方案。** openWakeWord 和 Porcupine 都需要自训'akari'这个唤醒词模型（openWakeWord 需要 ML 知识，Porcupine 免费额度有限）。低成本替代：用 Silero VAD + 短窗口 SpeechTranscriber 做全时监听 + 关键词匹配，代价是隐私感知和常驻功耗。",
+      "**权限与分发**：麦克风需要 `NSMicrophoneUsageDescription` + TCC 授权；'控制电脑'需要辅助功能（Accessibility）和屏幕录制权限，这两个必须用户手动到系统设置里勾选，无法程序化申请；带这些权限的 App 基本无法上 Mac App Store，只能走 Developer ID 签名 + 公证分发。这会直接影响你的产品形态决策，建议早决定。",
+      "**Qwen3.8-2.4T-A95B 的参数描述我没能完全核实**（抓取到的表述是'95B 参数，2.4T 激活'，明显是把 MoE 的总参/激活参数写反了，实际应为 2.4T 总参 / 95B 激活）。这个规模的模型和 akari 无关，列出来只是标记版本时间线，别按这个数字做任何决策。"
+    ]
+  },
+  "macos-window": {
+    "topic": "macOS 26 (Tahoe) 桌面驻留窗口实现技术 — akari 项目调研",
+    "summary": "本轮结论**大部分是在本机 macOS 26.6.1 / M4 Max / Swift 6.3.3 上真实编译运行验证的**，不是文档转述。\n\n**壁纸层（形态 A）完全可行。** macOS 26 的桌面壁纸实际由 **Dock 进程**画在 level `-2147483624`，Finder 桌面图标在 `-2147483603`。因此把 NSWindow 的 level 设为 `CGWindowLevelForKey(.desktopIconWindow) - 1`（= **-2147483604**）即可精确夹在「壁纸之上、图标之下」。实测该窗口可见、`isOpaque=false` + `backgroundColor=.clear` 时能与真实壁纸**正确 alpha 合成**（截图像素验证：壁纸 (24,44,71) → 叠加 85% 绿后 (81,217,66)）。`kCGDesktopWindowLevel`(-2147483623) 也可用但余量更小。collectionBehavior 用 `[.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]`。**不需要任何 entitlement**，App Sandbox 下可行，可上架 Mac App Store（Wallnetic 已上架，MIT 开源可抄）。\n\n**桌宠（形态 B）踩到 macOS 26 的真坑。** 我用合成 CGEvent 点击实测：**透明窗口「透明像素自动点击穿透」在 26.6.1 上已失效**——整个窗口矩形都吃鼠标事件，`hitTest` 返回 nil 也救不回来（窗口服务器早已选定接收窗口）。这是 26.3 RC 引入的回归（FB21879057），26.3 正式版修好、26.4 beta 复发，**到 26.6.1 仍是坏的**。唯一可靠方案：**16ms 轮询 `NSEvent.mouseLocation`，按是否命中角色不透明区动态切 `ignoresMouseEvents`**（LyricShiori 等生产项目正是这么做）。\n\n**动态壁纸扩展这条路是死的。** 本机确认 `com.apple.wallpaper` 扩展点存在（11 个系统 appex 在用），但其定义要求 **`com.apple.private.wallpaper.extension`** 私有 entitlement，第三方拿不到。`.saver` 屏保在 26.6 SDK 里**未被弃用**，但仍跑在 `legacyScreenSaver.appex` 里，且屏保≠桌面常驻。`NSWorkspace.setDesktopImageURL` 只吃静态图。\n\n**功耗实测**：2560×1440@60fps HEVC 硬解桌面壁纸窗口，M4 Max 上仅 **1.0–3.6% CPU、47MB RSS**。最大省电杠杆是 `NSWindow.didChangeOcclusionStateNotification`——实测在桌面层可用。\n\n可直接编译的骨架已验证 typecheck 通过：`/private/tmp/claude-501/-Volumes-data-Dev-01-PWR/95ba5170-8aa3-4224-b9f6-411f31cd2424/scratchpad/AkariWindows.swift`",
+    "options": [
+      {
+        "name": "形态 A：桌面壁纸层 NSWindow（推荐主力方案）",
+        "how": "borderless NSWindow，`level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) - 1)`（= -2147483604），`collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]`，`ignoresMouseEvents = true`，`isReleasedWhenClosed = false`，`canBecomeKey/Main` 覆写为 false。内容层可挂 AVPlayerLayer（预渲染视频，最省）或 MTKView（Live2D/3D 实时渲染）。每个 CGDirectDisplayID 建一个窗口，监听 `NSApplication.didChangeScreenParametersNotification` 热插拔重建。本机实测通过：窗口落在 Dock 壁纸窗(-2147483624)之上、Finder 图标(-2147483603)之下；透明窗口 alpha 合成正确。",
+        "pros": "完全无需 entitlement，App Sandbox 兼容，可上架 MAS；不抢焦点；被普通窗口自然遮挡，符合「壁纸」语义；`occlusionState` 在该层可用，能做被完全遮挡时暂停渲染；有 MIT 开源实现（Wallnetic）可直接对照。",
+        "cons": "被任何窗口挡住就看不见（这也是设计意图）；无法覆盖全屏 App 的 Space；桌面小组件(Notification Center, -2147483601)和图标永远压在你上面；macOS 26「点击壁纸显示桌面」功能与之交互未验证。",
+        "maturity": "production-ready",
+        "cost": "工程量小：核心窗口代码 <150 行。金钱成本 0（Apple 开发者账号 $99/年仅上架需要）。"
+      },
+      {
+        "name": "形态 B：桌宠悬浮 NSPanel + 指针轮询点击穿透",
+        "how": "`NSPanel(styleMask: [.borderless, .nonactivatingPanel])`，`level = .floating`(3)，`isOpaque=false` + `backgroundColor=.clear`，`collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]`，`isMovableByWindowBackground=true` 实现拖动。**关键**：默认 `ignoresMouseEvents=true`，用 `Task` 每 16ms 读 `NSEvent.mouseLocation`，判断是否落在角色不透明区（自己维护 alpha mask 或简单的圆/矩形碰撞），命中才置为 false。要压过全屏 App 需把 level 提到 `.screenSaver`(1000)。",
+        "pros": "永远可见，交互性最好，适合「AI 助理」形态；`.nonactivatingPanel` 点击不夺走当前 App 焦点；`sharingType = .none` 可让它不进截屏/录屏。",
+        "cons": "**透明像素自动穿透在 macOS 26.6.1 已失效**（本机合成点击实测确认），必须自己做指针轮询，多一个 60Hz 的常驻轮询任务；轮询与真实点击之间有 ≤16ms 竞态，快速划过边缘可能误吃一次点击；`.screenSaver` level 会盖住系统 UI，体验激进。",
+        "maturity": "usable",
+        "cost": "工程量中等：窗口 + 指针轮询 + alpha 命中测试约 300 行。需要为角色维护 hit mask。"
+      },
+      {
+        "name": "混合：壁纸层 + 悬浮交互层（对 akari 的实际推荐）",
+        "how": "角色本体（呼吸/转头/眨眼微动作、换装）走形态 A 贴在壁纸层，完全 `ignoresMouseEvents=true`，零交互成本、可被 occlusion 暂停；对话气泡 / 语音波形 / 快捷指令面板走形态 B 的小 NSPanel，只在需要时 `orderFrontRegardless()` 出现，用完即隐。语音唤醒/热键唤起交互层。",
+        "pros": "把「常驻好看」和「偶尔交互」拆开：常驻部分零鼠标逻辑、可被完全遮挡时停渲染，最省电；交互面板很小，指针轮询开销和误吃点击风险都大幅降低；两层可分别控制是否上 Metal。",
+        "cons": "两套窗口生命周期要同步（角色位置 → 气泡锚点），多显示器时更麻烦；用户会看到「角色在窗口后面但气泡在前面」的层级割裂感，需要设计上回避。",
+        "maturity": "usable",
+        "cost": "工程量 = A + B 再加约 100 行协调逻辑。"
+      },
+      {
+        "name": "Wallpaper Extension（com.apple.wallpaper appex）",
+        "how": "macOS 26 确实存在 `com.apple.wallpaper` ExtensionKit 扩展点，系统自带 11 个 appex 在用（WallpaperAerialsExtension、WallpaperDynamicExtension 等）。",
+        "pros": "若可用会是最原生的路径——由系统托管生命周期、自动处理 Space/全屏/省电。",
+        "cons": "**死路**：本机读取 `/System/Library/ExtensionKit/ExtensionPoints/com.apple.wallpaper.appexpt` 确认其 `EXRequiredEntitlements` 为 `com.apple.private.wallpaper.extension`（私有 entitlement），第三方无法获得；宿主还要 `com.apple.private.wallpaper.extension-host`。无公开文档、无 SDK 头文件。",
+        "maturity": "dead-end",
+        "cost": "不可行，不要投入。"
+      },
+      {
+        "name": "Screen Saver (.saver) 扩展",
+        "how": "继承 `ScreenSaverView`，打包为 .saver bundle，由 `/System/Library/Frameworks/ScreenSaver.framework/PlugIns/legacyScreenSaver.appex` 宿主加载。",
+        "pros": "macOS 26.6 SDK 中 ScreenSaver.framework 仍在且**未标记 deprecated**（本机 grep 头文件无任何 API_DEPRECATED）；是唯一官方支持的第三方「全屏动画」扩展点。",
+        "cons": "屏保只在**空闲时**播放，不是桌面常驻——不满足 akari「驻留桌面 + 随时对话」的核心需求；宿主进程名就叫 legacyScreenSaver，Apple 明显不再投入；macOS 26 上有已知 bug（预览时启动两份、preference pane 入口变成 Wallpaper 面板里的模态框）；无法接收桌面交互。",
+        "maturity": "usable",
+        "cost": "仅当想额外做一个「屏保模式」时值得，约 1-2 天。不能替代主方案。"
+      },
+      {
+        "name": "desktoppr / NSWorkspace.setDesktopImageURL 设视频壁纸",
+        "how": "命令行工具 desktoppr（scriptingosx）或直接调 `NSWorkspace.setDesktopImageURL(_:for:options:)`。",
+        "pros": "API 公开、简单、无权限门槛。",
+        "cons": "**只接受静态图片**，无法设置视频或动态内容；只作用于当前 Space，无法一次设置所有 Space；历史上 macOS 14.x 设置背景色失效（15.4 才修）。对 akari 完全不适用，只能用来做「静态兜底壁纸」。",
+        "maturity": "dead-end",
+        "cost": "不适用于动态需求。"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "本机 macOS 26.6.1 (build 25G76) / Apple M4 Max / Swift 6.3.3 (swiftlang-6.3.3.1.3), target arm64-apple-macosx26.0；两台 5120x2880 显示器，逻辑分辨率 2560x1440 @60Hz —— 与 akari 目标场景完全一致。",
+        "confidence": "high",
+        "source_url": "本机 sw_vers / swift --version / system_profiler 实测"
+      },
+      {
+        "fact": "实测窗口 level 常量（macOS 26.6.1）：desktopWindow = -2147483623；desktopIconWindow = -2147483603；backstopMenu = -20；normal = 0；floating = 3；modalPanel = 8；utility = 19；dock = 20；mainMenu = 24；statusBar = 25；popUpMenu/overlay = 101/102；dragging = 500；screenSaver = 1000；assistiveTechHigh = 1500；cursor = 2147483630。",
+        "confidence": "high",
+        "source_url": "本机 swiftc 编译 CGWindowLevelForKey 全枚举实测"
+      },
+      {
+        "fact": "NSWindow.Level.screenSaver 的真实值是 **1000**，不是广为流传的 101。Jim Fisher 2020 年那张常被引用的表在这一项上是错的（它把 screenSaver 和 popUpMenu 都列为 101）。",
+        "confidence": "high",
+        "source_url": "https://jameshfisher.com/2020/08/03/what-is-the-order-of-nswindow-levels/ （本机实测推翻）"
+      },
+      {
+        "fact": "macOS 26 的桌面壁纸由 **Dock 进程**绘制，窗口名为 `Wallpaper-<UUID>`，level = **-2147483624**；其下还有 WindowServer 的 `Display N Backstop`(-2147483626) 和 Wallpaper 进程的 `Offscreen Wallpaper Window`(-2147483625)。Finder 的桌面图标窗口在 **-2147483603**，通知中心桌面小组件在 -2147483601。",
+        "confidence": "high",
+        "source_url": "本机 CGWindowListCopyWindowInfo 实测转储"
+      },
+      {
+        "fact": "因此「壁纸之上、图标之下」的推荐 level 是 `CGWindowLevelForKey(.desktopIconWindow) - 1` = **-2147483604**。kCGDesktopWindowLevel(-2147483623) 同样在 Dock 壁纸窗之上、可见，但余量只有 1。",
+        "confidence": "high",
+        "source_url": "本机实测 + https://github.com/fatihkan/wallnetic/blob/main/src/Wallnetic/Engine/DesktopWindowController.swift"
+      },
+      {
+        "fact": "实测：`isOpaque = false` + `backgroundColor = .clear` 的 borderless NSWindow 放在 -2147483604，**能与真实系统壁纸正确 alpha 合成**。截图像素验证：壁纸原色 (24,44,71)，叠加 85% 不透明绿后变为 (81,217,66)。",
+        "confidence": "high",
+        "source_url": "本机 screencapture + PIL 像素前后 diff 实测"
+      },
+      {
+        "fact": "**重大坑**：macOS 26.6.1 上透明窗口的「透明像素自动点击穿透」已失效。用 CGEvent 合成点击实测：一个 isOpaque=false / backgroundColor=.clear 的 borderless 窗口，点击其**完全透明**的角落，事件仍被该窗口的 contentView 收到（mouseDown 触发）。只有 `ignoresMouseEvents = true` 才能整窗穿透。",
+        "confidence": "high",
+        "source_url": "本机 CGEvent .leftMouseDown 打在自建双层窗口上实测（避免误触第三方 App）"
+      },
+      {
+        "fact": "`NSWindow.windowNumber(at:belowWindowWithWindowNumber:)` 在透明区域也返回该透明窗口的 windowNumber，进一步佐证窗口服务器的命中测试不再考虑 alpha。",
+        "confidence": "high",
+        "source_url": "本机实测"
+      },
+      {
+        "fact": "该点击穿透回归是 macOS 26.3 RC 引入的（Feedback FB21879057 / FB21879511），Apple 回复「We've gotten a few similar reports on 26.3 RC and are investigating」；论坛称 26.3 正式版修复、26.4 beta 复发。本机 26.6.1 实测仍未修复。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/forums/thread/814798 与 https://developer.apple.com/forums/thread/814875"
+      },
+      {
+        "fact": "`hitTest` 返回 nil 无法实现部分穿透——窗口服务器已经选定了接收窗口。生产项目采用的可行做法是每 16ms 轮询 `NSEvent.mouseLocation` 并动态切换 `ignoresMouseEvents`（`NSEvent.mouseLocation` 不需要任何 TCC 权限）。",
+        "confidence": "high",
+        "source_url": "https://github.com/kasou-sekai/LyricShiori/blob/main/Sources/LyricShiori/UI/DesktopLyricsWindowController.swift"
+      },
+      {
+        "fact": "`com.apple.wallpaper` ExtensionKit 扩展点在 macOS 26.6 上存在，但 `/System/Library/ExtensionKit/ExtensionPoints/com.apple.wallpaper.appexpt` 明确要求 `EXRequiredEntitlements = { com.apple.private.wallpaper.extension: true }`，宿主需 `com.apple.private.wallpaper.extension-host` —— 均为私有 entitlement，第三方不可用。系统自带 11 个 appex 使用它（WallpaperAerialsExtension、WallpaperDynamicExtension、WallpaperImageExtension 等）。",
+        "confidence": "high",
+        "source_url": "本机 plutil -p /System/Library/ExtensionKit/ExtensionPoints/com.apple.wallpaper.appexpt"
+      },
+      {
+        "fact": "macOS 26.6 SDK 中 ScreenSaver.framework 依然存在（ScreenSaverView.h / ScreenSaverDefaults.h），且**没有任何 API_DEPRECATED 标注**（头文件 copyright 停在 2000-2020）。第三方 .saver 仍由 `/System/Library/Frameworks/ScreenSaver.framework/PlugIns/legacyScreenSaver.appex` 宿主加载；系统上不存在公开的 screensaver 扩展点。",
+        "confidence": "high",
+        "source_url": "本机 grep MacOSX.sdk ScreenSaver.framework/Headers + ls PlugIns"
+      },
+      {
+        "fact": "**桌面层窗口不需要任何特殊 entitlement**。Wallnetic（MIT，Mac App Store id6760347328）的 entitlements 仅有 app-sandbox、application-groups、network.client、files.user-selected.read-write、files.downloads.read-write、photos-library、scripting-targets(com.apple.Music) —— 沙盒开启且成功上架 MAS。",
+        "confidence": "high",
+        "source_url": "https://github.com/fatihkan/wallnetic/blob/main/src/Wallnetic/Resources/Wallnetic.entitlements"
+      },
+      {
+        "fact": "功耗实测：2560×1440 @60fps HEVC（20Mbps，VideoToolbox 硬解）经 AVPlayerLayer 渲染在桌面层窗口，M4 Max 上 CPU 占用 **1.0%–3.6%**（单核百分比），RSS 稳定 **47MB**。",
+        "confidence": "high",
+        "source_url": "本机 ffmpeg 生成测试视频 + 自建 Swift 壁纸程序 + ps 采样实测"
+      },
+      {
+        "fact": "`NSWindow.didChangeOcclusionStateNotification` 在桌面 level 窗口上**确实会触发且状态正确**（实测全屏桌面窗口报 VISIBLE，被覆盖的小窗口报 hidden）。这是最重要的省电杠杆：完全遮挡时停解码。",
+        "confidence": "high",
+        "source_url": "本机 occlusion 监听实测"
+      },
+      {
+        "fact": "Wallnetic 的省电策略（可直接抄）：pause 条件 = 屏幕睡眠 ∨ 屏保激活 ∨ 会话非活跃(锁屏/快速用户切换) ∨ 低电量模式 ∨ (电池供电 ∧ 用户选择电池暂停) ∨ (全屏 App 前台 ∧ 用户选择全屏暂停)。锁屏/屏保通知必须注册在 **DistributedNotificationCenter** 且用 `.deliverImmediately`（com.apple.screensaver.didstart/didstop、com.apple.screenIsLocked/Unlocked）。",
+        "confidence": "high",
+        "source_url": "https://github.com/fatihkan/wallnetic/blob/main/src/Wallnetic/Engine/PowerManager.swift"
+      },
+      {
+        "fact": "多显示器必须按 **CGDirectDisplayID**（NSScreen.deviceDescription[\"NSScreenNumber\"]）而不是 NSScreen 对象做 key —— NSScreen 在睡眠/唤醒/热插拔/改分辨率后会被重建，用对象当 key 会留下失效条目。热插拔监听 `NSApplication.didChangeScreenParametersNotification`。",
+        "confidence": "high",
+        "source_url": "https://github.com/fatihkan/wallnetic/blob/main/src/Wallnetic/Engine/DesktopWindowController.swift"
+      },
+      {
+        "fact": "Plash（sindresorhus，曾是最著名的 macOS 桌面网页壁纸实现）**已闭源** —— GitHub 仓库现在只剩 readme.md、.editorconfig、.gitattributes 和一张图，DesktopWindow.swift 已被删除。不要指望从它读代码。",
+        "confidence": "high",
+        "source_url": "本机 gh api repos/sindresorhus/Plash/git/trees/main?recursive=1"
+      },
+      {
+        "fact": "`NSWorkspace.setDesktopImageURL(_:for:options:)` / desktoppr 只支持静态图片，无法设置视频或动态壁纸；且只作用于当前 Space。",
+        "confidence": "medium",
+        "source_url": "https://github.com/scriptingosx/desktoppr"
+      },
+      {
+        "fact": "`CGWindowListCopyWindowInfo` 在未获 Screen Recording 授权时不返回 `kCGWindowName`，但 `kCGWindowOwnerPID` / `kCGWindowLayer` / `kCGWindowBounds` 仍可用 —— 检测全屏 App 只需后三者，因此**无需 TCC 授权**。",
+        "confidence": "medium",
+        "source_url": "https://hacktricks.wiki/en/macos-hardening/macos-security-and-privilege-escalation/macos-security-protections/macos-input-monitoring-screen-capture-accessibility.html"
+      },
+      {
+        "fact": "可编译验证的 Swift 骨架（含形态 A、形态 B、多显示器控制器）已通过 swiftc -typecheck：/private/tmp/claude-501/-Volumes-data-Dev-01-PWR/95ba5170-8aa3-4224-b9f6-411f31cd2424/scratchpad/AkariWindows.swift",
+        "confidence": "high",
+        "source_url": "本机 swiftc -O -parse-as-library -typecheck 实测通过"
+      },
+      {
+        "fact": "可参考开源实现：fatihkan/wallnetic（Swift+SwiftUI+Metal，MIT，51★，2026-08-15 活跃，MAS 上架，**最值得抄**）；thusvill/LiveWallpaperMacOS（ObjC++，919★，2026-08-18 活跃，用 kCGDesktopWindowLevel + fullScreenAuxiliary，含 wallpaperdaemon 架构）；haren724/wallpaper-player-mac（Swift，479★，2025-01 停更）；yoshidan/LiveDesk（Swift，11★）；alxndlk/wallper-app（346★）。桌宠向：not-elm/desktop-homunculus（Rust+Bevy+VRM，Apache-2.0，84★）；liwenka1/bongo-cat-next（Tauri+Live2D，MIT，147★）；Open-LLM-VTuber（Python，13.3k★，含 Live2D + LLM 语音对话，与 akari 目标最接近）；MidraLab/uDesktopMascot（Unity+VRM，Apache-2.0，352★）。",
+        "confidence": "high",
+        "source_url": "本机 gh api repos/* 实测元数据（stars/language/pushed_at/license）"
+      }
+    ],
+    "gotchas": [
+      "**最大的坑：透明区域点击穿透在 macOS 26.6.1 是坏的。** 网上 99% 的教程（包括 StackOverflow 高赞答案）都告诉你「透明像素会自动穿透」或「override hitTest 返回 nil」——本机合成点击实测两者都无效，整个窗口矩形都吃事件。做桌宠必须用 16ms 轮询 NSEvent.mouseLocation 动态切 ignoresMouseEvents。这是 26.3 RC 引入的回归 FB21879057，26.4 beta 复发，26.6.1 仍未修。",
+      "**不要相信 Jim Fisher 那张 NSWindow level 表**（2020 年，被大量转载）。它把 NSWindow.Level.screenSaver 写成 101，实际是 1000。凡是 level 数值，自己在目标系统上跑一遍 CGWindowLevelForKey。",
+      "**Plash 已闭源**，仓库只剩 readme。很多博客还在教「去看 Plash 的 DesktopWindow.swift」——那个文件已经不存在了。改看 fatihkan/wallnetic。",
+      "**Wallpaper Extension 是私有 API 死路。** com.apple.wallpaper 扩展点真实存在、系统自己用了 11 个，但需要 com.apple.private.wallpaper.extension entitlement。看到扩展点存在就以为能用会浪费好几天。",
+      "**屏保 ≠ 桌面常驻。** .saver 在 macOS 26.6 SDK 里没被弃用（可以做），但只在空闲时播放，无法满足 akari「随时对话」的需求；而且宿主进程叫 legacyScreenSaver，macOS 26 上有预览启动两份等已知 bug。",
+      "**isReleasedWhenClosed 必须设为 false。** 程序化创建的 NSWindow 默认 true，配合 CoreAnimation 动画会 over-release 崩溃（Wallnetic #206 就是解锁时崩溃）。",
+      "**多显示器不要用 NSScreen 对象当字典 key。** 睡眠/唤醒/热插拔/改分辨率后 NSScreen 会被重建，必须用 CGDirectDisplayID。这是个会在用户合盖再打开后才暴露的隐蔽 bug。",
+      "**锁屏/屏保通知只走 DistributedNotificationCenter，且必须 .deliverImmediately。** 注册到 NotificationCenter.default 上永远收不到；用默认的 .coalesce 时 AppKit 在 App 非活跃期间会挂起投递——而锁屏时 App 必然非活跃，等于永远收不到。Wallnetic 到 v1.4.1 才发现这个 bug。",
+      "**macOS 26 上给 titled 窗口设 backgroundColor=.clear + isOpaque=false 会让红绿灯按钮消失**（Tahoe 移除了按钮合成所需的背板）。Wallnetic #228。borderless 窗口不受影响，但主设置窗口要小心。",
+      "**锁屏界面（LoginWindow）无论如何都盖不住。** Wallnetic 曾做「锁屏视频壁纸」功能，用 screenSaverWindow+1 的 level 也不行——锁屏是独立的 secure session。该功能已被删除，官方说法是 macOS 不允许第三方在锁屏播放视频。别浪费时间。",
+      "**桌面小组件和图标永远压在你上面。** 通知中心小组件在 -2147483601，Finder 图标在 -2147483603，都高于任何可用的桌面层。角色的头不能挡住图标。",
+      "**macOS 26「点击壁纸显示桌面」（Desktop & Dock → Click wallpaper to reveal desktop）** 会把所有窗口推开。第三方桌面层窗口在该动画中的行为本次未验证，需实机确认是否被一起推开或闪烁。",
+      "**60fps 常驻的真实代价被低估也被高估。** 硬解视频路径实测只要 1–3.6% CPU（M4 Max），但那是**硬件解码**；如果角色是 Live2D/3D 实时渲染（MTKView + CPU 骨骼计算），成本会高一个量级。用预渲染视频 + 少量实时叠加是最省的架构。本次未能实测 Metal 实时渲染路径的功耗（powermetrics 需要 sudo，无密码不可用），该项标 medium 置信度。",
+      "**非交互测试无法覆盖 Space 切换与全屏 App 行为。** fullScreenNone vs fullScreenAuxiliary 的差异、Mission Control 下的表现、进入全屏 App 后桌面层是否仍渲染（浪费电），这三点我只有代码与文档证据，没有实机交互验证——上手第一天就应该手动验一遍。"
+    ]
+  },
+  "avatar": {
+    "topic": "akari 虚拟形象渲染方案:在 macOS 26 / Apple Silicon 上做\"写实 AI 偶像\"桌面驻留形象(可说话、有表情、可换装)的技术选型",
+    "summary": "结论先行:**参考视频那种效果的真实做法就是\"AI 生成视频 + 抠像 + 循环播放\",不是实时渲染。** Windows 上是 Wallpaper Engine 播 mp4,macOS 上对应物是一个 window.level = CGWindowLevelForKey(.desktopWindow) 的透明 NSWindow + AVPlayerLayer 播 HEVC-with-alpha。这条路 12-20 人天能做到 90-95% 还原度,是唯一能在个人项目预算内做出\"写实\"的路径。\n\n四条路的实际情况:\n(1) **预渲染视频循环**:macOS 是全世界对透明视频支持最好的平台——Apple 自 2019 起在 AVFoundation 里支持 HEVC-with-alpha(规范外的私有扩展),AVPlayerLayer 原生合成透明背景,AVPlayerLooper 做无缝循环。生成端用 Kling 3.0(~$0.10/秒)或开源 Wan-Alpha v2.0(CVPR 2026 Highlight,MIT,直接出 RGBA),抠像用 MatAnyone 2(CVPR 2026 Highlight)。**唯一硬伤是口型对不上**。\n\n(2) **Live2D**:年营收 <1000 万日元完全免费(中型企业初装 ¥50,000 + 月费 ¥20,000/平台/地区)。但 Live2D 本质是分层 2D 网格形变,做不出写实皮肤/头发/光影,风格还原度只有 40-55%,且写实模型的美术工期 15-40 人天。**不推荐**。\n\n(3) **3D VRM/VRoid**:VRoid 输出是二次元风,风格完全对不上;换成 MetaHuman 又有授权争议(Web 版 2026-11-05 关停)+ 实时皮肤渲染在 M 系列上只能到\"游戏角色\"水平。30-60 人天换 60-75% 还原度,**性价比最差**。\n\n(4) **实时数字人**:2026 SOTA(阿里 LiveAvatar 14B / 蚂蚁 Ditto)全部是 NVIDIA 80GB VRAM 级别,**Mac 上完全跑不了**。唯一能本地跑的是阿里 LiteAvatar(纯 CPU 30fps 2D 口型)和 FasterLivePortrait-MLX。云端 API 里 wan2.2-s2v 是异步 5-10 分钟出片(只能预生成),腾讯实时并发路 3,500-6,750 元/月/路(个人项目不可行)。\n\n**推荐路线**:第一阶段纯视频循环 + 音量驱动张嘴降级方案(12-20 人天);第二阶段把脸部区域换成本地 LiteAvatar/MuseTalk 贴片实现真口型(再加 20-30 人天,可达 85-92%)。换装在视频路线下 = 用 Qwen-Image-Edit-2511 改首帧后重新 I2V 生成整套素材。",
+    "options": [
+      {
+        "name": "路线 A(推荐主线):预渲染 AI 视频循环 + HEVC-alpha + 状态机",
+        "how": "生成端:用 Kling 3.0 / Seedance / 即梦按提示词生成 N 段短片(idle 呼吸、转头、眨眼、说话、点头、挥手、待机切换),或直接用开源 Wan-Alpha v2.0(基于 Wan2.1-T2V-14B,MIT 许可,原生输出 RGBA + PNG 序列,832×480×81帧)。抠像端:非 alpha 素材用 MatAnyone 2(CVPR 2026 Highlight)做视频级 matting 拿 alpha。编码端:ffmpeg -i in.mov -c:v hevc_videotoolbox -require_sw 1 -alpha_quality 0.1 -tag:v hvc1 -q:v 35 -vf \"premultiply=inplace=1\" out.mov,或直接用 Finder 的「编码所选视频文件」/ avconvert(源需为 ProRes 4444)。播放端:macOS App 建一个 borderless NSWindow,window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))(值 -2147483623;若要盖在图标之上用 .desktopIconWindow = -2147483603),collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle],isOpaque=false / backgroundColor=.clear / ignoresMouseEvents=true;内容层用 AVPlayerLayer(原生支持 alpha 合成)。无缝循环用 AVQueuePlayer + AVPlayerLooper。状态切换用双 AVPlayerLayer 交叉淡入(200-300ms),或预渲染显式的 A→B 过渡短片(推荐,视觉上完全无缝)。所有 clip 的首尾帧姿态必须对齐同一个「中立 pose」,否则切换会跳。",
+        "pros": "这就是参考视频本身的做法,视觉还原度天花板最高(90-95%);macOS 是透明视频支持最好的平台,AVFoundation 全链路官方支持;运行时零 AI 推理,CPU/GPU 占用低;素材可无限迭代替换;换装 = 重新生成一套素材,不改代码",
+        "cons": "口型是死穴——预渲染片段无法对上任意 TTS 文本;素材总量随「状态数 × 服装数」线性膨胀;HEVC-alpha 是 Apple 规范外扩展,素材离开 macOS 生态就播不了;1440p60 常驻解码有功耗代价",
+        "maturity": "production-ready",
+        "cost": "12-20 人天(桌面层窗口+播放器+状态机 3-5;素材流水线 5-8;过渡打磨 3;降级口型 2-5)。素材生成成本:Kling 约 $0.10/秒,30 段 × 6 秒 ≈ $18/套装;自建 Wan-Alpha 需 NVIDIA 卡(8卡训练/推理配置),Mac 本地跑不动"
+      },
+      {
+        "name": "路线 B(推荐第二阶段):视频壳 + 本地口型贴片混合",
+        "how": "身体/头发/衣服/光影继续用路线 A 的视频循环;只把嘴部(或整个脸部 crop)交给本地实时模型逐帧重绘,再 alpha 合成回视频层。候选模型:① 阿里 HumanAIGC/lite-avatar —— 纯 CPU 30fps,由 ASR 特征 → 嘴部参数预测 → 轻量 2D 人脸生成器三段组成,官方明说可部署到移动端;② 腾讯音乐 MuseTalk 1.5 —— 256×256 人脸区域,V100 上 30fps+,推理只走 UNet + VAE decoder(不是扩散循环),Mac 上需转 CoreML/ONNX Runtime 验证;③ FasterLivePortrait-MLX(Apple MLX 移植,MIT,支持 --realtime 摄像头驱动)。工程上把模型导出成 ONNX,用 ONNX Runtime 的 CoreML EP 或转 Core ML 包跑在 ANE/GPU 上,输出 256px 嘴部贴片后用 Metal 做 upscale + 边缘羽化贴回。",
+        "pros": "能拿到真·口型同步且保留写实画质,是唯一能同时满足「写实 + 会说话」的本地方案;LiteAvatar 纯 CPU 30fps 意味着 M 系列上留有大量性能余量;素材复用路线 A 的产物",
+        "cons": "贴片边界的色彩/光照连续性很难做,容易出现「嘴巴是另一个人的」;LiteAvatar 需要为每个形象单独准备训练/注册数据;三个模型都没有官方 Apple Silicon 支持,移植风险高;头部大幅转动时贴片会崩",
+        "maturity": "usable",
+        "cost": "在路线 A 基础上再加 20-30 人天(模型移植与 CoreML 转换 8-12;贴片对齐与融合 6-10;形象数据准备 3-5;性能调优 3)。风险:移植失败概率我估 30-40%"
+      },
+      {
+        "name": "路线 C:Live2D Cubism SDK for Native (Metal)",
+        "how": "Cubism 5 SDK for Native 已正式支持 Metal 渲染器(CubismNativeSamples 内含 Metal 示例工程,macOS 可直接跑)。流程:美术出分层 PSD(写实风需 100+ 图层,眼/眉/唇/发/衣分离)→ Cubism Editor PRO 建网格与参数 → 导出 .moc3 → C++ SDK 加载渲染到 CAMetalLayer → 挂到桌面层 NSWindow。口型直接驱动 ParamMouthOpenY / ParamMouthForm;表情走 .exp3.json;换装走 Part 可见性组切换。",
+        "pros": "授权对个人项目免费(年营收 <1000 万日元);运行时开销极低(几 MB 内存,GPU 占用可忽略);参数化控制精细,任意口型/表情/视线跟随鼠标都能做;换装是官方支持的 Part 切换",
+        "cons": "**风格上做不出写实**——本质是分层 2D 图片的网格形变,皮肤质感、头发流动、真实光影都无法表达,做「照片切割」风只会更恐怖谷;写实模型的分层美术工期极长;C++ SDK 集成到 Swift App 需要桥接;**授权条款有坑**:Running Royalty 计划列出的 4 个平台是 iOS/Android/HarmonyOS/Web,macOS/PC 桌面应用属于 One-time Purchase Content Plan,需单独跟 Live2D 确认",
+        "maturity": "production-ready",
+        "cost": "25-50 人天(SDK Metal 集成 5-8;动作/表情/口型接线 3-5;美术 15-40 人天或外包 ¥8,000-40,000 一个模型)。风格还原度只有 40-55%"
+      },
+      {
+        "name": "路线 D:3D VRM/VRoid + three.js 或 Unity/Godot",
+        "how": "VRoid Studio 出 VRM → 用 hinzka/52blendshapes-for-VRoid-face 补齐 ARKit 52 个 blendshape(社区称 Perfect Sync)→ pixiv/three-vrm 在 WKWebView 里渲染(窗口透明 + WKWebView 背景透明),或用 SceneKit/RealityKit 直接加载带 blendshape 的 USDZ。VRM 规范自带 aa/ih/ou/ee/oh 五个口型 expression,可直接接 viseme 流。要写实就得换 MetaHuman:Epic 2025 年放宽授权允许在其他引擎/DCC 使用,但 MetaHuman Creator 网页版 2026-11-05 关停,创建全部迁进 UE 5.7,且跨引擎授权说法有冲突。",
+        "pros": "换装最简单(换 mesh + material,半天一套);表情/口型控制维度最全(ARKit 52);模型资产可复用到 VR/游戏;three-vrm 生态成熟,文档齐全",
+        "cons": "**VRoid/VRM 天生是二次元风,和参考视频的写实完全不是一个赛道**;走 MetaHuman 路线要引入 Unity/Godot/UE 整个运行时(App 体积 300MB+),且实时皮肤/头发/次表面散射在 M 系列上只能到「3A 游戏角色」水平,离 AI 视频的照片感还差一截;MetaHuman 授权状态不明朗",
+        "maturity": "usable",
+        "cost": "二次元 VRM 路线 8-15 人天但风格还原度仅 25-35%;写实 MetaHuman 路线 30-60 人天 + 授权风险,还原度 60-75%"
+      },
+      {
+        "name": "路线 E:云端实时数字人 API(腾讯云智能数智人 / 阿里云百炼)",
+        "how": "腾讯云:购买形象租赁 + 实时会话并发路数,走云渲染或端渲染 SDK,客户端拿 WebRTC 流贴到桌面层。阿里云:wan2.2-s2v(异步生成)或 IMS 的实时对话式 AI。",
+        "pros": "效果由厂商保证,写实 3D 形象开箱即用;不占本地算力;有商用级 SLA",
+        "cons": "**价格对个人项目完全不可行**:腾讯 3D 写实实时并发 6,750 元/月/路、2D 标准 3,500 元/月/路;形象租赁 3D 写实 37,500 元/月;阿里 wan2.2-s2v 是异步 5-10 分钟出片、同时处理任务数=1,**根本不是实时**,只能当预生成工具;必须联网、有延迟、内容会过审(虚拟女友类内容大概率被拒)",
+        "maturity": "production-ready(但不适用本场景)",
+        "cost": "零开发成本但月付 3,500-6,750 元/路;wan2.2-s2v 按秒计费 0.5 元/秒(480P)/ 0.9 元/秒(720P),免费额度 100 秒"
+      },
+      {
+        "name": "路线 F(排除):本地全量实时扩散数字人",
+        "how": "阿里/中科大 LiveAvatar(ECCV 2026 Oral)、蚂蚁 Ditto(ACM MM 2025)、腾讯 MuseTalk 全量跑。",
+        "pros": "效果是当前 SOTA,LiveAvatar 支持 10,000 秒以上无限时长流式生成不漂移",
+        "cons": "**Mac 上没有任何可行路径**。LiveAvatar 是 14B 扩散模型,5×H800 才 45fps,单卡要 80GB VRAM(FP8 量化后 48GB);Ditto 只有 TensorRT/CUDA 实现,测试环境是 A100,代码库里完全没有 CoreML/MPS/Apple Silicon 的任何痕迹;LivePortrait 在 MPS 上比 RTX 4090 慢约 20 倍且需要 PYTORCH_ENABLE_MPS_FALLBACK=1(意味着部分算子回落 CPU)",
+        "maturity": "dead-end(在 Apple Silicon 上)",
+        "cost": "不建议投入。若坚持需外接 NVIDIA 服务器,等于回到路线 E 的成本结构"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "macOS/AVFoundation 自 2019 年(WWDC19 Session 506)起支持 HEVC with Alpha:AVPlayer/AVPlayerLayer 可直接以透明背景显示并与 Core Animation/AppKit 图层合成;也可用 AVPlayerItemVideoOutput 取解码帧给 Metal/SpriteKit,用 AVAssetImageGenerator 取带 alpha 的 CGImage,或直接用 VTDecompressionSession 调用 HEVC-alpha 解码器",
+        "confidence": "high",
+        "source_url": "https://asciiwwdc.com/2019/sessions/506"
+      },
+      {
+        "fact": "HEVC 带 alpha 是 Apple 在规范外(out of spec)实现的扩展,只有 Apple 编码器有端到端的 HEVC-alpha 到 MP4 编码支持;x265/nvenc 均无法产出",
+        "confidence": "high",
+        "source_url": "https://larryjordan.com/articles/include-transparency-alpha-channels-in-hevc-video/"
+      },
+      {
+        "fact": "macOS 上用 ffmpeg 产出 HEVC-alpha 的确切命令:ffmpeg -i in.mov -c:v hevc_videotoolbox -require_sw 1 -alpha_quality 0.1 -tag:v hvc1 -q:v 35 -vf \"premultiply=inplace=1\" out.mov;-alpha_quality 取值 0-1 单独控制 alpha 通道质量。也可用 Finder 的「编码所选视频文件」服务或命令行 avconvert(源建议 ProRes 4444)",
+        "confidence": "high",
+        "source_url": "https://kitcross.net/hevc-web-video-alpha-channel/"
+      },
+      {
+        "fact": "桌面层窗口设置:window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow))),.desktopWindow 原始值 -2147483623,.desktopIconWindow 为 -2147483603(决定在桌面图标之下还是之上);配合 collectionBehavior 的 .canJoinAllSpaces / .stationary / .ignoresCycle",
+        "confidence": "high",
+        "source_url": "https://jameshfisher.com/2020/08/03/what-is-the-order-of-nswindow-levels/"
+      },
+      {
+        "fact": "无缝循环用 AVQueuePlayer + AVPlayerLooper(AVPlayerLooper 内部实现 Apple 的 treadmill 专利,自动复制 AVPlayerItem 循环入队);Apple 官方示例代码 AVLoopPlayer,macOS 10.9+ 可用",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/documentation/avfoundation/avplayerlooper"
+      },
+      {
+        "fact": "Live2D SDK 发布授权按最近年营收分三档:小规模 <1000 万日元、中规模 1000 万~1 亿日元、大规模 ≥1 亿日元;若被其他企业实质控股则按控股方营收计",
+        "confidence": "high",
+        "source_url": "https://help.live2d.com/en/sdk/sdk_007/"
+      },
+      {
+        "fact": "Live2D Running Royalty Content Plan(游戏/应用)确切费用:一般用户与小规模企业(年营收 <1000 万日元)初装费与月费均为免费;中规模企业初装 ¥50,000($313.45)/发布地区,月费 ¥20,000($125.38)/平台/地区;大规模企业初装 ¥300,000($1,880.70)/地区,月费 ¥100,000($626.90)/平台/地区。发布地区 6 个,平台 4 个(iOS/Android/HarmonyOS/Web)",
+        "confidence": "high",
+        "source_url": "https://www.live2d.com/en/sdk/license/running_plan01/"
+      },
+      {
+        "fact": "Live2D 另有 VTuber 条款:若本应用作为业务主要构成要素且由其直接或间接产生的年营收超过 2000 万日元,必须签署 Publication License Agreement;开发/试用阶段不需要授权,仅在发布时需要",
+        "confidence": "high",
+        "source_url": "https://www.live2d.com/en/sdk/license/"
+      },
+      {
+        "fact": "Cubism 5 SDK for Native 支持 Metal 渲染器,CubismNativeSamples 含 Metal 示例;Cubism 5 SDK R5 beta3 起 for Native 全环境支持;Metal 与 OpenGL 的渲染差异已修复。注意:Cubism 5 SDK for Native 已宣布终止对 Cocos2d-x 的支持",
+        "confidence": "high",
+        "source_url": "https://github.com/Live2D/CubismNativeSamples"
+      },
+      {
+        "fact": "Wan-Alpha:GitHub WeChatCV/Wan-Alpha,基于 Wan2.1-T2V-14B,MIT 许可,直出 RGBA 视频(棋盘格背景 + PNG 序列),示例分辨率 832×480 / 81 帧;v2.0 于 2025 年 12 月发布并被 CVPR 2026 收为 Highlight;推理示例用 --nproc_per_node=8(8 卡);ComfyUI 官方支持标注为 Coming soon,但 HuggingFace 已有 Wan-Alpha_ComfyUI 版本",
+        "confidence": "high",
+        "source_url": "https://github.com/WeChatCV/Wan-Alpha"
+      },
+      {
+        "fact": "MatAnyone 2(CVPR 2026 Highlight,2025-12 发布,arXiv 2512.11782)是当前视频人像 matting SOTA,引入学习式 Matting Quality Evaluator(MQE),对真人拍摄和 AI 生成视频均可产出像素级 alpha",
+        "confidence": "high",
+        "source_url": "https://github.com/pq-yang/MatAnyone2"
+      },
+      {
+        "fact": "阿里云百炼 wan2.2-s2v:模型 ID wan2.2-s2v,端点 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/image2video/video-synthesis,480P 0.5 元/秒、720P 0.9 元/秒,免费额度 100 秒;输入音频 <15MB 且 <20s;**异步调用,任务处理约 5-10 分钟,同时处理中任务数量=1,限流 5 RPS,仅华北2(北京)可用**;需先过 wan2.2-s2v-detect 图片合规检测",
+        "confidence": "high",
+        "source_url": "https://help.aliyun.com/zh/model-studio/wan-s2v-api"
+      },
+      {
+        "fact": "腾讯云智能数智人 2026 定价(RMB):形象租赁 2D 小样本通用口型 50 元/月或 400 元/年、2D 专属口型 125 元/月或 1000 元/年、3D 卡通 18,800 元/月、3D 半写实 25,000 元/月、3D 写实 37,500 元/月;实时会话并发(云渲染)2D 标准 3,500 元/月/路、2D 高精 6,750 元/月/路、3D 半写实 5,200 元/月/路、3D 写实 6,750 元/月/路;端渲染 SDK 授权 2D 按设备 5,000 元/年、按应用 800,000 元/年、3D-H5 200,000 元/年、3D-UE 300,000 元/年;声音复刻极速版 39.9 元/个",
+        "confidence": "high",
+        "source_url": "https://cloud.tencent.com/document/product/1240/101944"
+      },
+      {
+        "fact": "阿里 HumanAIGC/lite-avatar:开源 audio2face 模型,**纯 CPU 即可 30fps 实时**,无需 GPU;三段结构 = ModelScope ASR 特征提取 + 嘴部参数预测 + 轻量 2D 人脸生成器,官方说明可部署到移动端做实时推理;推荐 Python 3.10 / CUDA 11.8(GPU 可选)",
+        "confidence": "high",
+        "source_url": "https://github.com/HumanAIGC/lite-avatar"
+      },
+      {
+        "fact": "腾讯音乐 MuseTalk 1.5:256×256 人脸区域在 NVIDIA Tesla V100 上 30fps+,起始延迟可忽略;推理时只涉及 UNet 和 VAE decoder(非扩散迭代),这是它快的根本原因;arXiv 2410.10122",
+        "confidence": "high",
+        "source_url": "https://github.com/TMElyralab/MuseTalk"
+      },
+      {
+        "fact": "阿里巴巴(夸克)+ 中科大 LiveAvatar(ECCV 2026 Oral,arXiv 2512.04677):14B 扩散模型,5 卡 H800 + 4 步采样达 45 FPS;单卡推理需 ≥80GB 显存,FP8 量化后可在 48GB 卡上跑;支持 10,000 秒以上连续生成;Apache 2.0;单卡推理代码 2025-12-12 放出,FP8/编译优化 2026-01-20",
+        "confidence": "high",
+        "source_url": "https://github.com/Alibaba-Quark/LiveAvatar"
+      },
+      {
+        "fact": "蚂蚁集团 Ditto(ACM MM 2025,arXiv 2411.19509):测试环境 CentOS 7.2 + A100 + Python 3.10 + TensorRT 8.6.1,仅 NVIDIA CUDA(Ampere 及以上有预编译模型),**代码库中完全没有 CoreML / Apple Silicon / MPS 支持**;Apache-2.0;2025-11-12 放出训练代码",
+        "confidence": "high",
+        "source_url": "https://github.com/antgroup/ditto-talkinghead"
+      },
+      {
+        "fact": "LivePortrait 在 Apple Silicon 上需 PYTORCH_ENABLE_MPS_FALLBACK=1 python inference.py,速度约为 RTX 4090 的 1/20;社区有 MLX 移植 ivanfioravanti/fasterliveportrait-mlx(MIT,需 Apple Silicon + macOS + Python 3.11+ + ffmpeg + uv,支持 --realtime 摄像头驱动,实时摄像头模式仅单人脸),但**仓库未公布具体 M 系列芯片的 FPS 数字**",
+        "confidence": "medium",
+        "source_url": "https://github.com/ivanfioravanti/fasterliveportrait-mlx"
+      },
+      {
+        "fact": "Azure Neural TTS 提供 viseme:需订阅 Speech SDK 的 VisemeReceived 事件(**REST API 不支持 viseme**);使用 22 个 viseme ID(0-21),事件中还可带 blendshape 数据",
+        "confidence": "high",
+        "source_url": "https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/azure-neural-text-to-speech-extended-to-support-lip-sync-with-viseme/2356748"
+      },
+      {
+        "fact": "ElevenLabs 提供字符级时间戳端点 /v1/text-to-speech/{voice_id}/with-timestamps,返回音频 + 每个字符在合成语音中的起始时间(毫秒级 alignment 数组),可映射到 10 个英文口型",
+        "confidence": "high",
+        "source_url": "https://elevenlabs.io/blog/new-text-to-speech-endpoints-with-timestamps"
+      },
+      {
+        "fact": "VRM 规范原生带 aa / ih / ou / ee / oh 五个口型 blendshape;ARKit 52 blendshape 在 VTuber 社区称为 Perfect Sync,由日本开发者 hinzka 于 2020 年底提出,hinzka/52blendshapes-for-VRoid-face 提供了补齐 VRoid 模型 52 blendshape 的改造版 VRM;pixiv/three-vrm 支持 VRM 1.0 的 expression 系统",
+        "confidence": "high",
+        "source_url": "https://github.com/hinzka/52blendshapes-for-VRoid-face"
+      },
+      {
+        "fact": "MetaHuman:Epic 于 2025 年 6 月更新授权,允许在任意游戏引擎或 DCC(含 Unity、Godot)中商用使用 MetaHuman 角色;但 MetaHuman Creator 网页版最终关停日为 2026-11-05,创建流程全部迁入 UE 5.7 的编辑器内工具。跨引擎授权的具体边界(如 DNA 文件/基础拓扑的再分发)在不同来源说法冲突,签约前必须直接核实 EULA",
+        "confidence": "medium",
+        "source_url": "https://www.cgchannel.com/2025/06/you-can-now-sell-metahumans-or-use-them-in-unity-or-godot/"
+      },
+      {
+        "fact": "Kling API 定价(2026):开发者 API 按秒计费,5 秒 1080p 带音高质量片段 1.0 Unit/秒 = $0.70;试用包 $9.80 / 100 Resource Units / 30 天 / 5 并发;标准包 $700 / 5,000 units。第三方转售价 Kling 3.0 约 $0.10/秒",
+        "confidence": "medium",
+        "source_url": "https://renderful.ai/blog/kling-api-pricing"
+      },
+      {
+        "fact": "Qwen-Image-Edit-2511 相比 2509 版人物一致性错误率从 38.6% 降到 12.1%(降幅超 60%),支持多人合影中对单人精准换装并保持光影一致 —— 可用于 akari 的「换皮肤」首帧生成",
+        "confidence": "medium",
+        "source_url": "https://developer.cloud.tencent.com/article/2695728"
+      },
+      {
+        "fact": "OpenAvatarChat(HumanAIGC-Engineering,Apache-2.0)0.6.0 版于 2026 年 4 月发布,支持 LiteAvatar / LAM / MuseTalk / SoulX-FlashHead 四种形象渲染后端,平均响应 2.2 秒;文档未提及 CPU-only 或 macOS/Apple Silicon 兼容性",
+        "confidence": "medium",
+        "source_url": "https://github.com/HumanAIGC-Engineering/OpenAvatarChat"
+      },
+      {
+        "fact": "Apple 研究的 HeadsUp(2026-05)可从多相机阵列前馈重建高质量 3D Gaussian 头部,渲染 60 FPS 实时;Apple Silicon 上已有成熟 3DGS 渲染栈(MetalSplatter 支持 macOS/iOS/visionOS,M4 Max 上 Mip-NeRF 360 场景约 350 FPS)—— 是写实实时头像的一条远期备选路",
+        "confidence": "medium",
+        "source_url": "https://machinelearning.apple.com/research/hugs"
+      }
+    ],
+    "gotchas": [
+      "**口型是路线 A 的唯一死穴,必须一开始就设计降级路径。** 最简可行方案:AVAudioEngine 在播放节点上 installTap,每 1/60 秒算一次 RMS,用 attack≈30ms / release≈120ms 平滑后映射到 0..1 的张嘴幅度;再做个粗糙的两段能量拆分(低频能量高→\"aa\" 圆口,高频能量高→\"ee/ss\" 扁口)就能骗过 80% 的观感。这套约 1-2 人天。别一上来就追求音素级精确。",
+      "**HEVC-with-alpha 是 Apple 规范外的私有扩展。** 素材只能在 Apple 生态播放;x265、nvenc、Adobe Media Encoder 都无法产出(Adobe 社区大量此类求助帖)。ffmpeg 必须用 hevc_videotoolbox + -require_sw 1 + -tag:v hvc1,且要 -vf premultiply=inplace=1,少一个参数出来的就是黑底不透明。",
+      "**AVPlayerLooper 与 AVVideoComposition 冲突。** Apple 开发者论坛有明确记录:一旦给 AVPlayerItem 挂了 AVVideoComposition,AVPlayerLooper 就会失效。也就是说「无缝循环」和「逐帧滤镜/色彩调整」二选一。要两者兼得只能改用 AVSampleBufferDisplayLayer 自己喂帧。",
+      "**Live2D 授权条款里 macOS/PC 桌面应用不在 Running Royalty 计划的 4 个平台(iOS/Android/HarmonyOS/Web)里。** PC 归到 One-time Purchase Content Plan,费率结构完全不同。而且 SDK 发布授权的门槛是年营收 1000 万日元,VTuber 使用条款的门槛却是 2000 万日元 —— 两套数字容易搞混。任何商业化之前必须书面跟 Live2D 确认 akari 归哪一类。",
+      "**阿里 wan2.2-s2v 完全不是实时的,别被「数字人 API」四个字骗了。** 异步任务处理 5-10 分钟、同时处理中任务数量硬限制为 1、仅华北2(北京)地域、且必须先过 wan2.2-s2v-detect 图片合规检测。它只能当离线素材生成工具,做不了对话。",
+      "**内容审核会拦「虚拟女友」类素材。** 国内所有视频生成 API(可灵/即梦/万相)都有内容合规检测,写实女性形象 + 暗示性提示词被拒概率很高;而且生成的人脸不能与真实公众人物相似(肖像权)。建议:形象设定偏「助理/伙伴」而非「女友」来过审,或者用开源 Wan-Alpha 在本地(需 NVIDIA 卡)自己生成绕开审核。",
+      "**2026 年的实时数字人 SOTA 在 Mac 上一个都跑不了。** LiveAvatar 单卡要 80GB 显存(FP8 后 48GB),Ditto 只有 TensorRT + A100 实现且代码里没有任何 CoreML/MPS 痕迹。看到论文标题写 \"Realtime\" 不要当成「消费级硬件实时」—— 那是 5 张 H800 的实时。",
+      "**LivePortrait 在 MPS 上约为 RTX 4090 的 1/20 速度,且需要 PYTORCH_ENABLE_MPS_FALLBACK=1** —— 这个环境变量本身就说明有算子回落到 CPU,性能不可预期。MLX 移植版仓库至今没公布任何 M 系列的 FPS 数字,别把「有 MLX 版本」当成「能实时」。移植前务必先跑 benchmark 脚本实测。",
+      "**功耗和发热。** 1440p60 的 HEVC-alpha 常驻解码里,alpha 层往往走软解(-require_sw 说明编码端就是软的),桌面常驻会明显掉续航。必须实现:窗口被完全遮挡时(监听 NSWindow.occlusionState / NSApplication 的 occlusionState)暂停播放;接电池时自动降到 30fps 或切静态帧;这两条不做用户第一天就会卸载。",
+      "**桌面层窗口的鼠标交互是个矛盾。** ignoresMouseEvents=true 才不会挡住桌面图标和其他 App,但那样也点不到她。可行做法:桌面层窗口纯展示 + 另开一个 .floating 级别的小窗口承载交互(点击/输入框),或者用全局事件监听(需要 Accessibility 权限)在鼠标悬停到形象区域时临时把 ignoresMouseEvents 切成 false。",
+      "**「控制电脑」这个能力和渲染是完全独立的权限问题:** 需要 AXIsProcessTrusted() + 用户在 系统设置 > 隐私与安全性 > 辅助功能 里手动勾选,还可能需要「屏幕录制」权限。这两个权限都不能靠代码申请,只能引导用户手动开,而且开启后 App 签名一变(重新编译)权限就失效,开发期会反复踩。",
+      "**素材量会爆炸。** 状态数 × 服装数 × 每状态时长。做 8 个状态 × 4 套服装 × 6 秒 × 1440p60 HEVC-alpha,单文件约 15-40MB,合计 0.5-1.3GB。加上 App 分发体积,必须做按需下载,不能全打进 bundle。",
+      "**AI 生成的循环片段首尾不闭合。** 生成模型不保证首帧末帧姿态一致,直接 loop 会「跳一下」。解决办法:提示词里锁死起始姿态 + 生成后手工挑首尾接近的帧裁剪 + 必要时用 3-5 帧的交叉溶解掩盖。这部分手工打磨占素材流水线一半以上工时,别低估。",
+      "**MetaHuman 授权状态在 2026 年是模糊的。** 官方 2025-06 说可用于任意引擎,但也有 2026-03 的来源说「不存在 Blender/Maya 的跨引擎授权」,且 DNA 文件/基础拓扑的再分发受限;Creator 网页版 2026-11-05 就关停了。如果打算走写实 3D,必须在投入前逐字读 https://www.unrealengine.com/eula/mhc 并留存截图。"
+    ]
+  },
+  "macos-control": {
+    "topic": "akari — 在 macOS 26 (Tahoe) 上让 AI agent \"控制电脑\" 的能力边界与实现",
+    "summary": "本机实测（macOS 26.6.1 / Swift 6.3.3 / arm64）结论：macOS 26 上\"控制电脑\"的四条通路全部可用，但代价是权限弹窗和分发方式的硬约束。\n\n**能力边界（实测）**：Accessibility API 完全健在——`AXUIElementCreateApplication` + `AXUIElementCopyAttributeValue` 对 Finder / Chrome / VS Code / IntelliJ / 微信 / 文本编辑全部返回成功，Chrome 在 depth≤8 就暴露 8560 个节点，能直接读到 `AXTextArea.AXValue`（1943 字符）和 `AXSelectedText`。Electron 应用（VS Code）只暴露 519 个节点，设 `AXManualAccessibility=true` 返回成功但树不扩张（实测 before/after 都是 519），`AXEnhancedUserInterface` 直接 `kAXErrorNotImplemented(-25208)`。所以**读选中文本必须三级 fallback**：AX → Services/剪贴板 → 模拟 Cmd+C。\n\n**截图**：`CGWindowListCreateImage` 已在 macOS 15.0 **obsoleted**（本机用 MacOSX26.5.sdk 编译直接报错，不是 warning），必须走 `SCScreenshotManager.captureImage(contentFilter:configuration:)`；实测 1 次调用拿到 2560×1440 CGImage，耗时可忽略。\n\n**键鼠**：`CGEventPost` 需要 Accessibility 里的独立子权限 Post Event，用 `CGPreflightPostEventAccess()` / `CGRequestPostEventAccess()` 探测与申请（本机三个 preflight 全 true）。\n\n**分发是最大的硬墙**：Apple DTS 明确回答，沙盒 App **不能**用 `AXUIElementCreateApplication`，因此 akari 想读别的 App 的 UI 树就**上不了 Mac App Store**，只能 Developer ID + 公证 + stapler 分发（自 10.15 起强制）。\n\n**模型侧**：Qwen 线现在有真正能打的 computer-use 模型——`qwen3.8-max`（2.4T MoE / 95B 激活 / 1M ctx，OSWorld-Verified 86.1%，$2/$6 per M tokens）已超过 72.4% 的人类基线；Qwen-UI-Agent（arXiv 2607.28227，27B/35B-A3B/4B）OSWorld-Verified 79.5%、ScreenSpot-Pro 81.5%。但**准确率≠可用**：86% 成功率意味着每 7 个任务错 1 个，且延迟在秒级，绝不能拿它当日常主路径。\n\n**推荐架构**：以\"结构化工具（AX + Shortcuts + shell 白名单 + MCP）\"为主路径，把 VLM 截图点击当兜底逃生舱，并强制确认门。",
+    "options": [
+      {
+        "name": "A. 结构化工具层为主（AX + AppleScript/Shortcuts + shell 白名单）——推荐",
+        "how": "用 Swift 直接调 ApplicationServices：`AXUIElementCreateApplication(pid)` 拿 App 根元素，`AXUIElementCopyAttributeValue` 读 `kAXChildrenAttribute`/`kAXRoleAttribute`/`kAXValueAttribute`/`kAXSelectedTextAttribute`，`AXUIElementSetAttributeValue` 填输入框，`AXUIElementPerformAction(el, kAXPressAction)` 点按钮，`AXUIElementCopyElementAtPosition(app, x, y, &el)` 做坐标反查。务必先调 `AXUIElementSetMessagingTimeout(app, 2.0)` 否则卡死的 App 会拖垮整个 agent（本机实测必需）。App 控制用 `/usr/bin/shortcuts run <name>`（子命令只有 run/list/view/sign，本机已验证）+ `NSAppleScript`/`osascript`。文件与命令走自建的白名单 shell 工具。把这些包成一组 LLM function tools 交给 Qwen 文本模型（qwen3.8-max 或 qwen3.7-plus）。",
+        "pros": "确定性高、可审计、每步都能 dry-run 和回滚；延迟毫秒级，不烧 vision token；出错可精确定位到某个 AX 节点；权限只需 Accessibility 一项就覆盖读+写+键鼠。",
+        "cons": "Electron/Java Swing/游戏引擎类 App 的 AX 树残缺甚至为空（VS Code 实测 0 个可读文本节点）；每接一个新 App 都要写适配；AppleScript 词典在 Tahoe 有回归（Music 的 current track 事件被移除）。",
+        "cost": "钱：仅模型调用，文本 tool-calling 成本 ≈ $2/M in（qwen3.8-max）或 $0.03/M in（qwen3.7-flash）。工程：2-3 周做出 20 个左右稳定工具 + 权限引导流程。",
+        "maturity": "production-ready"
+      },
+      {
+        "name": "B. computer-use 风格 VLM（截图 + 坐标点击）",
+        "how": "ScreenCaptureKit 截图（`SCShareableContent.excludingDesktopWindows` → `SCContentFilter(display:excludingWindows:)` → `SCStreamConfiguration` → `SCScreenshotManager.captureImage`），下采样后喂给 `qwen3-vl-plus` / `qwen3.8-max` / 本地 Qwen3-VL-8B(MLX)，模型返回 **0-1000 归一化坐标**（Qwen 系列固定这个坐标系，`px = coord/1000 * 图片边长`），再用 `CGEventPost` 或 `cliclick` 落点。开源可直接抄：openclaw/Peekaboo（Swift，MIT，brew install steipete/tap/peekaboo，同时封装了 AX 树 + 截图 + 点击 + MCP server）、trycua/cua（MIT，跨 OS，带 lume 做 Apple Virtualization VM 隔离）。",
+        "pros": "通用，任何 App 都能操作，包括 AX 完全不暴露的（游戏、Canvas、远程桌面）；模型能力在快速上涨（OSWorld 一年从 12% 涨到 86%）。",
+        "cons": "慢（每步一次截图+VLM 推理，秒级）、贵（2560×1440 一张图就是几千 visual token）、不确定（86% 成功率 = 每 7 步错 1 步，且错法不可预测）；截图流是 prompt injection 的头号入口（屏幕上任何一段文字都可能是攻击载荷）；ScreenSpot-Pro 这种高分辨率 grounding 基准 SOTA 才 81.5%，2560×1440 上点错像素很常见。",
+        "cost": "钱：qwen3.8-max $2/M in + $6/M out，一次 50 步的任务轻松 $0.3-1；本地 Qwen3-VL-8B MLX 免费但需 16GB+ 统一内存、grounding 明显更弱。工程：1-2 周接通，但把成功率调到能用要长期迭代。",
+        "maturity": "usable"
+      },
+      {
+        "name": "C. 复用现成 MCP server 生态",
+        "how": "akari 内嵌一个 MCP client，挂载社区 server：wonderwhy-er/DesktopCommanderMCP（终端+文件+diff 编辑，6.1k stars，`npx @wonderwhy-er/desktop-commander@latest setup`）、steipete/macos-automator-mcp（AppleScript/JXA + 200 条现成脚本，MIT，816 stars，`npx -y @steipete/macos-automator-mcp`）、openclaw/Peekaboo（截图+GUI 点击+菜单栏，MIT，4.7k stars）、mattt/iMCP（日历/通讯录/信息/提醒，MIT，1.45k stars，原生菜单栏 App）、recursechat/mcp-server-apple-shortcuts（跑快捷指令）、modelcontextprotocol/servers 的 filesystem（`npx -y @modelcontextprotocol/server-filesystem <dir>`，目录级白名单）。",
+        "pros": "零到一最快；工具描述、参数校验、错误处理都是现成的；Peekaboo 的 Swift 源码本身就是 AX+SCK 的最佳参考实现。",
+        "cons": "引入 Node/Bun 运行时依赖，打包进 .app 后签名和公证会麻烦（Electron 类 App 在 Tahoe 上因为 bundle 变更导致 Local Network / TCC 权限反复丢失是已知问题）；第三方 server 的权限继承走 responsible process，弹窗会归到 akari 头上但用户看不懂；supermemoryai/apple-mcp 已于 2025-08 归档只读，别再用。",
+        "cost": "钱：0（除模型）。工程：3-5 天接通 MCP client，但打包+公证一整套子进程另算 1 周。",
+        "maturity": "production-ready"
+      },
+      {
+        "name": "D. 只用 Shortcuts / App Intents（最安全的下限方案）",
+        "how": "akari 自己用 App Intents 框架暴露一批 intent，同时通过 `shortcuts run <name>` 调用用户已有的快捷指令。所有系统操作（发信息、建日程、控制音乐、开关设备、文件操作）都由用户在 Shortcuts.app 里预先编排好，akari 只负责\"选哪个快捷指令 + 填参数\"。",
+        "pros": "几乎零权限成本（不需要 Accessibility、不需要 Screen Recording）；能上 Mac App Store；用户完全掌控可执行动作的集合，天然就是白名单；Apple 明确在往这个方向推（App Intents 是 2026 年给 Shortcuts 供给动作的官方管线）。",
+        "cons": "能力天花板极低，做不了\"帮我在这个网页上把表单填了\"这类事；快捷指令在 App 内 / CLI / 自动化三种上下文里的权限是分开授予的，行为不一致；用户要自己会编快捷指令。",
+        "cost": "钱：0。工程：1 周。",
+        "maturity": "production-ready"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "CGWindowListCreateImage 在 macOS 15.0 已 obsoleted（不是 deprecated）。本机用 Xcode 的 MacOSX26.5.sdk 编译 Swift 直接报硬错误：\"'CGWindowListCreateImage' is unavailable in macOS: Please use ScreenCaptureKit instead\" + \"note: 'CGWindowListCreateImage' was obsoleted in macOS 15.0\"（CoreGraphics/Headers/CGWindow.h:271）。CGDisplayCreateImage 同理。",
+        "confidence": "high",
+        "source_url": "https://trac.macports.org/ticket/71136"
+      },
+      {
+        "fact": "ScreenCaptureKit 的 SCScreenshotManager.captureImage(contentFilter:configuration:) 在 macOS 26.6.1 实测可用：SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) 返回 displays=2 / windows=59 / applications=17，单次截图拿到 2560×1440 CGImage。搭配 SCContentFilter(display:excludingWindows:) 与 SCStreamConfiguration（width/height/captureResolution=.best）。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/documentation/screencapturekit/scscreenshotmanager"
+      },
+      {
+        "fact": "macOS 26.6.1 上 Accessibility API 完全可用。实测 AXUIElementCreateApplication(pid) + AXUIElementCopyAttributeNames 对以下 App 全部返回 kAXErrorSuccess(0)：文本编辑(19 attrs/4 windows)、访达(20/2)、1Password(20/1)、Google Chrome(19/2)、微信(19/1)、IntelliJ IDEA(19/2)、VS Code(20/1)、Typora(19/1)。",
+        "confidence": "high",
+        "source_url": ""
+      },
+      {
+        "fact": "AX 树深度实测（depth≤8 节点数）：Google Chrome 8560、IntelliJ IDEA 1570、文本编辑 406、VS Code(Electron) 507、微信 199。Chrome 无需任何额外开关就完整暴露网页 AX 树。",
+        "confidence": "high",
+        "source_url": ""
+      },
+      {
+        "fact": "AXSelectedText 实测可读：文本编辑的 AXTextArea 读到 AXValue 长度 1943 且 AXSelectedText 返回选中的 URL 文本；Google Chrome 的 AXTextField（depth 9）也能读到 AXValue 与 AXSelectedText。VS Code(Electron) 在 depth≤10 内 AXTextArea/AXTextField/AXStaticText 节点数为 0。",
+        "confidence": "high",
+        "source_url": ""
+      },
+      {
+        "fact": "AXManualAccessibility（Electron/Chromium 私有属性）在 VS Code 上 AXUIElementSetAttributeValue 返回 kAXErrorSuccess(0)，但等待 3 秒后 AX 树节点数完全没变（before=519, after=519）——即设置成功但没有真正开启完整 a11y 树。在 Chrome/文本编辑/IntelliJ/微信 上返回 kAXErrorAttributeUnsupported(-25205)。AXEnhancedUserInterface 在所有测试 App 上返回 kAXErrorNotImplemented(-25208)。",
+        "confidence": "high",
+        "source_url": "https://github.com/electron/electron/issues/37465"
+      },
+      {
+        "fact": "权限探测/申请 API（macOS 26 SDK 下全部可编译可调用）：AXIsProcessTrusted() / AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt)、CGPreflightScreenCaptureAccess() / CGRequestScreenCaptureAccess()（macOS 10.15+）、CGPreflightListenEventAccess() / CGRequestListenEventAccess()（macOS 11.0+，对应 Input Monitoring）、CGPreflightPostEventAccess() / CGRequestPostEventAccess()（macOS 11.0+，对应 Accessibility 下的 Post Event 子权限）。本机四项 preflight 均返回 true。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/documentation/coregraphics/cgrequestposteventaccess()"
+      },
+      {
+        "fact": "Post Event 与 Input Monitoring 是两个不同的权限，但都显示在 System Settings > Privacy & Security > Accessibility 面板下。CGRequestPostEventAccess 与 App Sandbox 兼容。",
+        "confidence": "medium",
+        "source_url": "https://developer.apple.com/forums/thread/730441"
+      },
+      {
+        "fact": "Apple DTS 明确答复：Mac App Store 沙盒 App 可以拿到 Accessibility 权限（DTS 工程师自称有两个这类上架 App），但沙盒 App 无法使用 AXUIElementCreateApplication() 去获取别的 App 的 accessibility 对象引用——问\"沙盒里能做到吗\"，答\"No\"。替代方案是 CGEventTap（走 Input Monitoring）。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/forums/thread/756130"
+      },
+      {
+        "fact": "自 macOS 10.15 起，App Store 外分发的 App 必须 Developer ID 签名 + 公证（notarization）+ stapler；公证不能替代签名。需要有效的 Apple Developer Program 订阅（$99/年）与 app-specific password。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/macos/distribution/"
+      },
+      {
+        "fact": "Automation（Apple Events）的 TCC 服务名是 kTCCServiceAppleEvents，按 (源 App, 目标 App) 成对授权。Info.plist 必须有 NSAppleEventsUsageDescription（弹窗上显示的文案），Hardened Runtime 下还要 com.apple.security.automation.apple-events entitlement。",
+        "confidence": "high",
+        "source_url": "https://hacktricks.wiki/en/macos-hardening/macos-security-and-privilege-escalation/macos-security-protections/macos-tcc/index.html"
+      },
+      {
+        "fact": "其他相关 TCC 服务名：kTCCServiceAccessibility（辅助功能）、kTCCServiceScreenCapture（屏幕录制）、kTCCServiceListenEvent（输入监控）、kTCCServicePostEvent、kTCCServiceSystemPolicyAllFiles（完全磁盘访问）。重置用 `tccutil reset kTCCServiceAccessibility com.your.bundleid`，关键词大小写敏感，且 tccutil 不提供列出可重置服务的方法。TCC.db 位于 ~/Library/Application Support/com.apple.TCC/ 与 /Library/Application Support/com.apple.TCC/，两处在本机均为 \"Operation not permitted\"（需 FDA 才能读）。",
+        "confidence": "high",
+        "source_url": "https://ss64.com/mac/tccutil.html"
+      },
+      {
+        "fact": "CLI 工具（非 .app bundle）要发 Apple Events 必须在 __TEXT/__info_plist 段内嵌 Info.plist（含 CFBundleIdentifier + NSAppleEventsUsageDescription），并用 `codesign --force --sign <identity> --options runtime --entitlements <plist> --identifier <bundle-id>` 签名；否则弹窗会归属父进程（如终端）。校验用 `otool -s __TEXT __info_plist <binary>` 与 `codesign -d --entitlements - <binary>`。让子进程对自己的权限负责需要私有 API responsibility_spawnattrs_setdisclaim。",
+        "confidence": "high",
+        "source_url": "https://steipete.me/posts/2025/applescript-cli-macos-complete-guide"
+      },
+      {
+        "fact": "沙盒 App 申请 com.apple.security.temporary-exception.apple-events 指向 com.apple.finder / com.apple.terminal / System Events 会被 App Store 审核直接驳回（有多个实际被拒案例）。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/forums/thread/794326"
+      },
+      {
+        "fact": "macOS Sequoia 15 把屏幕录制的重新授权提示从每周改成每月（beta 6 起），且不再每次重启都提示。macOS 26 Tahoe 把面板改名/合并为 \"Screen & System Audio Recording\"。",
+        "confidence": "medium",
+        "source_url": "https://9to5mac.com/2024/08/14/macos-sequoia-screen-recording-prompt-monthly/"
+      },
+      {
+        "fact": "macOS 26.1 (Tahoe) 起，非 bundle 的裸可执行文件不再出现在 System Settings → Privacy & Security → Screen & System Audio Recording 列表里（Sequoia 时还会出现），虽然仍会弹窗且授权后仍能截屏，但用户无法在 UI 里管理它。Tahoe 的 TCC 按 responsible process 而非 parent process 判定屏幕录制权限。",
+        "confidence": "medium",
+        "source_url": "https://developer.apple.com/forums/thread/807898"
+      },
+      {
+        "fact": "/usr/bin/shortcuts 的子命令只有 run / list / view / sign（本机 macOS 26.6.1 实测 `shortcuts --help`）。同一个快捷指令在 App 内、CLI、自动化三种上下文下的权限是分别授予的，行为可能不同。",
+        "confidence": "high",
+        "source_url": "https://blakecrosley.com/guides/shortcuts"
+      },
+      {
+        "fact": "macOS 26 上 AppleScript 有回归：Music App 的 AppleScript 不再支持 current track 事件，原本控制播放/取轨道信息/操作播放列表的脚本失效；Automator 的 AppleScript actions 已标记 deprecated。Apple 正把 App Intents 作为给 Shortcuts 供给动作的官方管线。",
+        "confidence": "medium",
+        "source_url": "https://www.macscripter.net/t/changes-to-the-shortcuts-app-in-tahoe/77180"
+      },
+      {
+        "fact": "qwen3.8-max：2026-08-03 发布，2.4T 总参数 / 95B 激活的 MoE，1M 上下文，最大输出 131,072 tokens，支持文本+图像+视频输入，API model id 为 `qwen3.8-max`，定价 $2 / M input tokens、$6 / M output tokens。官方宣称 OSWorld-Verified 86.1（对比 GPT-5.6 Sol Max 83.2、Claude Fable 5 85.0、Gemini 3.1 Pro 76.2）。",
+        "confidence": "medium",
+        "source_url": "https://www.marktechpost.com/2026/08/03/alibaba-qwen-releases-qwen3-8-max/"
+      },
+      {
+        "fact": "OSWorld-Verified 排行榜（BenchLM，2026-08-18 更新，369 个真实任务，30 个模型）：Qwen3.8 Max 86.1%（开放权重）、Claude Mythos 5 85%、Claude Fable 5 85%、Qwen3.8-27B 84.3%（开放权重）、Claude Opus 4.8 83.4%、Gemini 3.6 Flash 83%、Holo3-35B-A3B 82.6%（开放权重）、Claude Sonnet 5 81.2%。人类基线 72.4%。",
+        "confidence": "medium",
+        "source_url": "https://benchlm.ai/benchmarks/osworld-verified"
+      },
+      {
+        "fact": "Qwen-UI-Agent 技术报告（arXiv 2607.28227，2026-07-30）：三个变体 27B / 35B-A3B / 4B；OSWorld-Verified 79.5%、ScreenSpot-Pro 81.5%、WebArena 73.6%、MobileWorld 82.1%、MobileWorld-Real 92.2%、AndroidDaily 97.5%。统一动作空间把 GUI 操作与 CLI 执行交织（click/type/drag + bash + API call + batched actions）。报告中未确认开放权重、未给出 HuggingFace repo 名或 DashScope model id、未提及 macOS 支持。",
+        "confidence": "medium",
+        "source_url": "https://arxiv.org/html/2607.28227"
+      },
+      {
+        "fact": "Qwen3-VL 的 grounding 坐标是归一化到 0-1000 的整数（不是绝对像素），输出字段 bbox_2d 为 [x1,y1,x2,y2]；转回像素为 px = coord/1000 * 对应边长。Alibaba Cloud Model Studio 上的 vision 模型 id 包含 qwen3-vl-plus 与 qwen3-vl-flash（均支持最长 1 小时 / 2GB 视频输入），以及更新的 qwen3.7-plus（1M ctx / 64k 输出 / 2048 张图）、qwen3.6-plus、qwen3.6-flash、qwen3.6-35b-a3b（256k ctx）。",
+        "confidence": "medium",
+        "source_url": "https://deepwiki.com/QwenLM/Qwen3-VL/5.2-spatial-understanding-and-2d-grounding"
+      },
+      {
+        "fact": "Model Studio OpenAI 兼容端点（区域化）：新加坡 https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1，北京 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1，美国弗吉尼亚 https://{WorkspaceId}.us-east-1.maas.aliyuncs.com/compatible-mode/v1。",
+        "confidence": "medium",
+        "source_url": "https://www.alibabacloud.com/help/en/model-studio/what-is-model-studio"
+      },
+      {
+        "fact": "openclaw/Peekaboo（原 steipete/Peekaboo）：MIT 许可，macOS 15.0+，Swift 6.2+，安装 `brew install steipete/tap/peekaboo` 或 npm `@steipete/peekaboo`（Node 22+）。子命令：see / click / type / press / scroll / drag / set-value / action / app / window / menu / menubar / dock / dialog / space / agent / capture / mcp / browser / tools / screen list / window list / permissions status / config。需要 Screen Recording + Accessibility + 合成输入权限。底层用 AXUIElement + 屏幕捕获，可作为 MCP server 运行。约 4,677 stars，v3.4.0（2026-06）。",
+        "confidence": "high",
+        "source_url": "https://github.com/openclaw/Peekaboo"
+      },
+      {
+        "fact": "macOS 可用 MCP server（2026-06/08 状态）：wonderwhy-er/DesktopCommanderMCP（终端+文件+diff 编辑，MIT，6,138 stars，`npx @wonderwhy-er/desktop-commander@latest setup`）；steipete/macos-automator-mcp（AppleScript/JXA + 200+ 脚本配方，MIT，816 stars，`npx -y @steipete/macos-automator-mcp`）；mattt/iMCP（日历/通讯录/信息/提醒/位置/天气，MIT，1,450 stars，原生菜单栏 App）；recursechat/mcp-server-apple-shortcuts（跑快捷指令）；modelcontextprotocol/servers 的 filesystem（`npx -y @modelcontextprotocol/server-filesystem <dir>`，目录级白名单，支持 Roots 动态指定）；microsoft/playwright-mcp（浏览器走 a11y tree，Apache-2.0，33.7k stars）。",
+        "confidence": "medium",
+        "source_url": "https://modelpiper.com/blog/best-macos-mcp-servers-2026"
+      },
+      {
+        "fact": "supermemoryai/apple-mcp（即社区常说的 Dhravya apple-mcp，3,114 stars，npm @dhravya/apple-mcp，最新 0.2.7）自 2025-08 起已归档只读，不要作为新项目依赖；Calendar/Messages/Contacts 的维护替代是 mattt/iMCP。",
+        "confidence": "medium",
+        "source_url": "https://modelpiper.com/blog/best-macos-mcp-servers-2026"
+      },
+      {
+        "fact": "trycua/cua：MIT 许可的开源 computer-use 基础设施（Y Combinator X25），含 Cua Driver（后台驱动原生桌面 App，不抢鼠标焦点，macOS/Windows/Linux 同一套 CLI + MCP server）与 lume（用 Apple Virtualization.framework 在 Apple Silicon 上跑 macOS/Linux VM，不依赖 Docker Desktop/Parallels/VMware）。",
+        "confidence": "medium",
+        "source_url": "https://github.com/trycua/cua"
+      },
+      {
+        "fact": "读取 Messages / Mail 数据需要 Full Disk Access（kTCCServiceSystemPolicyAllFiles）：~/Library/Messages/chat.db 与 ~/Library/Mail/V10/MailData/Envelope Index。",
+        "confidence": "high",
+        "source_url": "https://github.com/krmj22/macos-mcp"
+      },
+      {
+        "fact": "回环地址 127.0.0.1 / ::1 理论上豁免 macOS 的 Local Network 权限（流量不出设备）。但 Tahoe 26.3.1 上有实际 bug：Electron 类 App 因代码签名或 bundle 变更被当成新 App，从 Privacy & Security → Local Network 列表消失，导致连不上 http://localhost:xxxx。",
+        "confidence": "medium",
+        "source_url": "https://github.com/Kong/insomnia/issues/9783"
+      },
+      {
+        "fact": "本机 macOS 26.6.1 的 `say -v '?'` 列出 184 个语音，含 zh_CN（Eddy/Flo/Grandma/Grandpa/Reed/Rocko 等）与 ja_JP（含 Kyoko）。API 侧走 AVSpeechSynthesizer；Personal Voice 需 AVSpeechSynthesizer.requestPersonalVoiceAuthorization，授权后 Personal Voice 会出现在 AVSpeechSynthesisVoice.speechVoices() 中并带 isPersonalVoice trait。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2023/10033/"
+      },
+      {
+        "fact": "NSServices（Services 菜单）取选中文本的做法：Info.plist 的 NSServices 数组里配 NSMessage（对应 Objective-C 方法 messageName:userData:error:）、NSPortName、NSMenuItem（字典，key 为 \"default\"）、NSSendTypes（NSPasteboard 类型或 UTI），App 启动时 [[NSApplication sharedApplication] setServicesProvider:self]，服务由 pbs 注册。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/SysServices/Articles/properties.html"
+      }
+    ],
+    "gotchas": [
+      "【最大的坑】沙盒 App 不能用 AXUIElementCreateApplication。这意味着 akari 只要想读别的 App 的 UI 树，就彻底放弃 Mac App Store，只能 Developer ID + 公证分发。别在这上面浪费时间做双版本——直接定 Developer ID。",
+      "【责任进程陷阱，本机实测】我在终端里 swiftc 编译出的 ad-hoc 签名裸二进制，AXIsProcessTrusted() 直接返回 true 并能完整读取所有 App 的 AX 树——因为 TCC 把权限归属到 responsible process（终端）。开发期你会觉得\"权限不用申请嘛\"，一旦打包成独立 .app 全部失效。必须尽早用真实 .app bundle + Developer ID 签名来测权限流程。",
+      "【权限绑定代码签名】Accessibility / Screen Recording 授权绑定的是 App 的代码签名 + bundle id。换签名证书、改 bundle id、甚至某些 CI 重签名，都会让用户已授予的权限静默失效，且旧条目还赖在系统设置列表里。发版流程必须锁死签名身份。",
+      "【AXSelectedText 在 Electron 上必挂】VS Code 实测 depth≤10 内 0 个可读文本节点；设 AXManualAccessibility=true 返回成功(0) 但 AX 树节点数纹丝不动（519→519）。Electron issue #37465 至今未解。所以 akari 的\"朗读选中文本\"必须走三级 fallback：AXSelectedText → 检查前台 App 是否 Electron/Java → 保存剪贴板 → CGEventPost 模拟 Cmd+C → 读 pbpaste → 恢复剪贴板。恢复剪贴板这步经常被忘，会把用户原本复制的东西吃掉。",
+      "【模拟 Cmd+C 的隐性副作用】在 Vim/Emacs/终端/游戏里 Cmd+C 可能触发别的行为甚至发 SIGINT；在只读或无选区时会静默失败但你读到的是旧剪贴板内容（要用 NSPasteboard.changeCount 判断是否真的变了）。",
+      "【CGWindowListCreateImage 编译期就死】不是 deprecated warning，是 unavailable 硬错误（obsoleted in macOS 15.0）。任何还在用它的第三方库（旧版 JUCE、cliclick 5.0.1、screen_capture_lite）在 macOS 26 SDK 下都编不过。选依赖前先确认已迁移到 ScreenCaptureKit。",
+      "【AX 调用会卡死主线程】某些 App（尤其是无响应的、跨进程 IPC 慢的）会让 AXUIElementCopyAttributeValue 一直阻塞。必须对每个 app element 调 AXUIElementSetMessagingTimeout(app, 1.0~2.0)，并且所有 AX 遍历放到后台队列——否则 akari 的壁纸动画会直接掉帧卡住。",
+      "【屏幕录制每月重新弹窗】Sequoia 15 引入的每周提示改成了每月，Tahoe 沿用（面板改名 Screen & System Audio Recording）。对一个\"常驻桌面的女友\"来说，每月弹一次\"akari 正在录制你的屏幕\"体验非常糟。建议：把截图能力做成按需开启的开关，不要开机就常驻 SCStream。",
+      "【macOS 26.1+ 裸可执行文件不进权限列表】非 .app bundle 的 CLI 拿了屏幕录制权限后不出现在系统设置列表里，用户想撤销都找不到——用户会觉得被偷装了后门。所有需要权限的组件都要打成正规 .app bundle。",
+      "【Automation 权限是 N×M 的】akari 要控制 10 个 App 就要弹 10 次\"akari 想要控制 XXX\"，每个都得用户点\"好\"。而且没有 API 能主动触发这个弹窗，只能在第一次真实发 Apple Event 时才弹。要设计成\"用到才要\"，并在 UI 里预告要弹什么。",
+      "【沙盒里申请 apple-events 临时豁免 = 被拒】com.apple.security.temporary-exception.apple-events 指向 Finder / Terminal / System Events 是 App Store 明确点名驳回的。",
+      "【Tahoe 的 AppleScript 回归】Music 的 current track 事件被移除，大量老脚本直接失效；Automator 的 AppleScript actions 已 deprecated。别把 AppleScript 当长期稳定基座，能走 Shortcuts / App Intents 的优先走。",
+      "【VLM 点击的准确率现实】ScreenSpot-Pro（高分辨率专业界面 grounding）SOTA 才 81.5%，2560×1440 这种分辨率上模型点错位置很常见。OSWorld 86% 是端到端多步任务成功率、且允许多次重试和长 horizon，不代表单次点击可靠。绝不能把\"删除文件\"\"发送消息\"\"付款\"这类不可逆操作交给纯坐标点击。",
+      "【截图是 prompt injection 的正门】只要 akari 会把屏幕内容喂给模型，屏幕上任何一段文字（网页、邮件、聊天窗口、甚至别人发来的图片）都能变成指令。防御必须是架构级：截图内容一律标记为 untrusted，任何在\"读过 untrusted 内容\"之后发起的状态变更类工具调用，强制走人工确认门；shell 能力与外部内容处理绝不放在同一个上下文里。",
+      "【MCP server 的信任边界】社区 MCP server 跑在你的用户态、继承你的权限。DesktopCommander 这类给了 shell 就等于给了全机器。要么用 lume/trycua 起 VM 隔离，要么自己实现命令白名单 + 参数校验，别直接把 npx 来的 server 接到一个会读屏幕的 agent 上。",
+      "【依赖已归档的仓库】supermemoryai/apple-mcp 自 2025-08 归档只读，很多博客和 awesome-list 还在推荐它。选 MCP server 前先看 last commit。",
+      "【Local Network 权限 bug】理论上 127.0.0.1 豁免，但 Tahoe 26.3.x 上 Electron/重签名 App 会从 Local Network 列表消失导致连不上本地端口。如果 akari 用本地 HTTP 跟子进程通信，改用 Unix domain socket 或 XPC 更稳。",
+      "【读邮件/短信要 Full Disk Access】chat.db 和 Mail Envelope Index 都在 FDA 保护范围内。FDA 是权限里最吓人的一项，用户拒绝率很高，而且 macOS Sonoma 起有\"重启后 FDA 失效\"的历史 bug。个人 agent 想读邮件，优先走 EventKit / Mail 的 AppleScript 词典，不要直接读 SQLite。",
+      "【本地跑 Qwen3-VL 做 grounding 内存吃紧】35B-A3B 的 MLX 4-bit VLM 峰值约 20.5GB 统一内存，跟你 2560×1440 60fps 的写实壁纸渲染抢同一块内存和 GPU。壁纸 + 本地 VLM 同机跑，M4 Max 64GB 起步；否则 grounding 走云端 qwen3-vl-plus。",
+      "【用户要点多少次同意（现实估算）】辅助功能 1 次 + 屏幕录制 1 次（且每月复弹）+ 输入监控 1 次（若用 CGEventTap 监听）+ 麦克风 1 次 + 语音识别 1 次 + 通知 1 次 + 日历/提醒/通讯录各 1 次 + 每个被控 App 的 Automation 各 1 次 + 可能的完全磁盘访问 1 次。全量放开是 12-15 次点击，其中辅助功能和完全磁盘访问还需要用户手动去系统设置里开、并输入密码解锁。必须做分阶段渐进授权：首启只要麦克风+通知，其余等第一次真正用到再引导。"
+    ]
+  },
+  "prior-art": {
+    "topic": "akari（macOS 桌面 AI 虚拟女友/助理）——同类开源与商业产品调研：能抄什么",
+    "summary": "结论先行：**这个赛道上没有一个项目能直接拿来当 akari 的底座，但有三块可以整段抄走的现成资产**——AIRI 的 macOS computer-use MCP（Swift + Quartz CGEvent 注入 + NSWorkspace/CGWindowList 观察，工具面已定义好）、Open-LLM-VTuber 的多后端 ASR/TTS/LLM 适配层与打断式语音管线、以及 macOS 壁纸层的窗口级别写法（NSWindow.level = CGWindowLevelForKey(kCGDesktopWindowLevelKey)）。\n\n生态现状（2026-08 核实）：AIRI（moeru-ai/airi，48,060⭐，MIT，日更）已经是事实标准，Electron 单体，Live2D/VRM/MMD/Spine/立绘五套渲染并存，已有 desktop-overlay / spotlight / caption / widgets 多窗口架构，且**已内置 macOS 电脑控制 MCP**；Open-LLM-VTuber（13,329⭐，MIT，Python）功能最全但实质半停更（最后功能提交 2026-02，最后 release 2025-08，v2 仍在\"完全重写、早期规划\"）。macOS 原生阵营很薄：Miru（68⭐，Apache-2.0）是唯一\"原生 macOS + Live2D 桌宠 + 长期记忆（纯 Markdown）+ 主动搭话\"的组合；其余 Swift 桌宠（agentpet 325⭐、openpets 89⭐）都是像素小宠物、只做 Claude Code 状态可视化。中文强项目（Soul-of-Waifu 1,229⭐、handcrafted-persona-engine 1,354⭐、my-neuro 1,335⭐）**全部 Windows + CUDA 独占**，只能抄思路不能跑。\n\n商业侧：Wallpaper Engine 永无 Mac 版；Plash 已闭源且要求 macOS 26；**Desktop Mate 已经上架 macOS Tahoe + Apple Silicon**（免费本体 + ¥2,200/角色 DLC），是最直接的商业竞品；VTube Studio 在 Mac 免费且开放 WebSocket 插件 API（ws://localhost:8001），可以完全不写渲染器、直接驱动它。\n\n关键方向性风险：参考的\"写实风 2560×1440 60fps\"**不可能是 Live2D**，多半是预渲染视频循环；实时写实驱动（LivePortrait / MuseTalk / EchoMimic）在 M 系列上到不了 60fps。Live2D 的 \"Expandable Application\" 条款也会卡住\"用户可导入自己模型\"这个功能。",
+    "options": [
+      {
+        "name": "抄 AIRI 的 computer-use-mcp（最高优先级，直接用）",
+        "how": "仓库 moeru-ai/airi 里的 services/computer-use-mcp 是一个独立的 MCP server，专为 macOS 写的。executor 模式分 dry-run / macos-local / linux-x11；macos-local 后端用 NSWorkspace + CGWindowList 做窗口观察，用 Swift + Quartz CGEvent 做鼠标键盘注入，用 open -a / activate 做 App 打开与聚焦。已定义的工具名可以直接照搬：desktop_get_capabilities / desktop_observe_windows / desktop_screenshot / desktop_open_app / desktop_focus_app / desktop_click / desktop_type_text / desktop_press_keys / desktop_scroll / desktop_wait；终端侧 terminal_exec / terminal_get_state / terminal_reset_state；浏览器 DOM 侧 browser_dom_read_page / browser_dom_find_elements / browser_dom_click / browser_dom_set_input_value 等；审批与审计 desktop_list_pending_actions / desktop_approve_pending_action / desktop_reject_pending_action / desktop_get_session_trace。它的设计原则也值得抄：工具优先、视觉观察只做补充、终端命令走后台 shell runner 而不是脚本化 Terminal 标签页、每次 run 带 approval queue + audit log + trace。MIT 协议，可直接 vendored。",
+        "pros": "这是全网唯一一个已经落地的「macOS 原生电脑控制 + MCP + 人工审批」实现，省掉 akari「控制电脑」这条主线 2-3 个月；MIT 无污染；工具面已经过 e2e smoke 验证（src/bin/smoke-macos.ts、e2e-developer-workflow.ts）。",
+        "cons": "是 TypeScript + Swift 混合，Swift 部分要自己编译（src/utils/swift.ts 调外部 Swift 二进制）；耦合了 AIRI 的 approval 协议和 Eventa 事件总线，剥离要花功夫；文档自己承认 v1 仍在演进。",
+        "maturity": "usable",
+        "cost": "钱：0。工程：剥离 + 适配约 1-2 人周；如果连 AIRI 的 approval/audit 一起抄则 2-3 人周。"
+      },
+      {
+        "name": "抄 Open-LLM-VTuber 的语音管线与多后端适配层（抄架构，不抄代码）",
+        "how": "Python 3.10–3.12 + uv。ASR 后端抽象层已接：sherpa-onnx、FunASR、Faster-Whisper、Whisper.cpp、Whisper、Groq Whisper、Azure ASR；TTS：sherpa-onnx、pyttsx3、MeloTTS、Coqui-TTS、GPT-SoVITS、Bark、CosyVoice、Edge TTS、Fish Audio、Azure TTS；LLM：Ollama、OpenAI 兼容、Gemini、Claude、Mistral、DeepSeek、智谱、GGUF、LM Studio、vLLM（Qwen 在 config_templates/conf.ZH.default.yaml 里有现成配置）。前端在独立仓库 Open-LLM-VTuber-Web（Electron + TypeScript），桌宠模式 = 透明背景 + 全局置顶 + 鼠标点击穿透。Agent 层用继承实现，已有 HumeAI EVI / OpenAI Her / Mem0 三种参考实现。",
+        "pros": "打断（voice interruption）和 hands-free 是它的核心卖点，管线设计经过 13k star 验证；配置文件即插即用的后端抽象设计非常干净，值得原样照抄到 Swift/TS 里；MIT。",
+        "cons": "实质半停更：最后一次功能提交 2026-02-11，2026-05-15 只改了 README badge，最后 release v1.2.1 是 2025-08-26；长期记忆功能被「临时移除」至今未回；v2.0 是「完全重写、早期规划阶段」，现在跟进等于跟一个要被废弃的分支；Python 单体不适合做 macOS 原生 App 的进程内组件。",
+        "maturity": "usable",
+        "cost": "钱：0。工程：只读它的 asr/tts/agent 三个目录，把接口抽象重写一遍，约 1 人周。"
+      },
+      {
+        "name": "抄 Miru 的 macOS 原生外壳 + 记忆/主动搭话设计",
+        "how": "kiyotakali/Miru，Apache-2.0，68⭐，2026-08-12 仍在更新。原生 macOS App（非 Electron）+ Live2D 角色覆盖层，配一个 Flask 后端和 Android 端，通过邀请码在个人服务器上同步同一个角色。两个可抄的设计：(1) AttentionEngine——根据用户当前活动和情绪状态决定何时主动开口；(2) 记忆分四类（projects / people / yourself / topics）+ 每日 journal + commitment list，全部以纯 Markdown 文件落盘，不用向量库。LLM 分三档配置：vision（截屏理解）/ chat / memory，可混用不同 provider。截图分析后即丢弃。",
+        "pros": "是唯一一个「原生 macOS + Live2D + 长期记忆 + 主动性」都齐的参考；纯 Markdown 记忆方案对 akari 这种单用户场景足够且可读可审计，比上向量库省事；Apache-2.0 可商用。",
+        "cons": "星数低（68），代码成熟度未知；Live2D 覆盖层是浮在桌面上的桌宠窗口，不是壁纸层，和 akari 的「贴桌面背景」目标不同；Flask 后端是多余的一层。",
+        "maturity": "experimental",
+        "cost": "钱：0。工程：读 + 抄 AttentionEngine 与记忆 schema 约 3-5 天。"
+      },
+      {
+        "name": "壁纸层渲染：抄 macOS live wallpaper 开源实现的窗口级别写法",
+        "how": "关键 API 是 NSWindow.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(CGWindowLevelKey(rawValue: 2)!)))，其中 2 = kCGDesktopWindowLevelKey（在桌面图标之下），18 = kCGDesktopIconWindowLevelKey（配合 +1 可盖住图标，用来做「交互模式」）。配套 window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]，并用 ignoresMouseEvents 在「壁纸模式」和「可交互模式」间切换。这段完整实现见 Aperturesurvivor/universe-screen 的 Sources/UI/WallpaperWindowController.swift。可参考的完整壁纸引擎：thusvill/LiveWallpaperMacOS（919⭐，ObjC++/SwiftUI，macOS 14+，仅 mp4/mov）、laobamac/MirageWallpaper（115⭐，GPL-3.0，支持 web/video/scene 三类壁纸）、haren724/wallpaper-player-mac（479⭐，Swift，2025-01 后停更）。",
+        "pros": "这是 akari「贴在桌面背景层」的唯一可行路径，且已被多个 4-digit star 项目验证；纯 AppKit，无第三方依赖；用 web 壁纸（WKWebView）就能把 Live2D/WebGL 塞进壁纸层，和 AIRI 的 Web 渲染路线兼容。",
+        "cons": "kCGDesktopWindowLevelKey 不是有文档保证的公开契约，Apple 每个大版本都可能变；App Store 沙盒下基本不可用；多显示器 / Space 切换 / Stage Manager / 锁屏 / 全屏 App 各自都有坑；MirageWallpaper 是 GPL-3.0，抄代码会传染。",
+        "maturity": "production-ready",
+        "cost": "钱：0。工程：自己实现壁纸窗口控制器约 3-5 天，把多显示器和 Space 的边界情况填平再加 1-2 周。"
+      },
+      {
+        "name": "本地语音链路：Pipecat + MLX Whisper + Silero VAD + Kokoro（照着 kwindla/macos-local-voice-agents 搭）",
+        "how": "kwindla/macos-local-voice-agents（334⭐，Pipecat 作者阵营出品）给出了一套已验证的 M 系列 Mac 本地组合：VAD 用 Silero VAD、STT 用 MLX Whisper、LLM 走 LM Studio 起的 OpenAI 兼容本地服务、TTS 用 Kokoro（经 mlx-audio 预下载模型）。README 声称在「相对强的模型」下端到端语音延迟 <800ms。安装是 uv run 起 /server，npm run dev 起 /client（React）。框架层三选一：pipecat-ai/pipecat（14,275⭐，BSD-2-Clause，日更，集成库最大，pipeline/frame 心智模型）、livekit/agents（13,069⭐，Apache-2.0，WebRTC room 心智模型，胜在规模与电话接入）、TEN-framework/ten-framework（11,061⭐，多模态图编排）。akari 是单机本地，不需要 WebRTC/电话，Pipecat 是更合适的那个。",
+        "pros": "barge-in / VAD / turn-taking 这些最难自己写对的部分是现成的；MLX Whisper 在 Apple Silicon 上是原生加速路径；BSD-2 无约束。",
+        "cons": "macos-local-voice-agents 最后一次 push 是 2025-08-26，已停更近一年，Pipecat 这一年 API 变动很大，直接跑基本要改；整条链是 Python，要嵌进 Swift App 得当子进程管；Kokoro 音色是英日为主，中文女声质量要另找（可换 Qwen3-TTS 或 DashScope CosyVoice）。",
+        "maturity": "usable",
+        "cost": "钱：0（全本地）。工程：照着搭通约 1 周，接进原生 App 再 1-2 周。"
+      },
+      {
+        "name": "不写渲染器：直接驱动 VTube Studio（Mac 版免费）",
+        "how": "VTube Studio 在 Steam（app 1325860）上 Windows + macOS 都免费，只有去水印 DLC 收 ¥1,520。它开放 VTube Studio Public API：WebSocket，默认 ws://localhost:8001（端口可配），UDP 47779 每 2 秒广播做服务发现。认证是两步——先发 AuthenticationTokenRequest（带插件名/作者名/128×128 图标）弹窗让用户授权拿 token，之后每次 AuthenticationRequest 带 token 即可。能控制的东西足够多：加载/卸载模型、移动旋转缩放（position X/Y、rotation、size -100~+100）、触发 hotkey、激活表情（带 0-2 秒淡入）、注入自定义 tracking 参数（set 独占 / add 叠加两种模式，每插件最多 100 个自定义参数）、按 ArtMesh 名称/标签/分组做 color tint、控制物理强度与风力、加载 PNG/GIF/Live2D item 并 pin 到 ArtMesh 上。官方列了各语言 SDK：pyvts / coovts（Python）、VTS-Sharp（C#）、vtubestudio-rs（Rust）、VTubeStudioJS（JS）。",
+        "pros": "零渲染工作量就能拿到工业级 Live2D 表现和口型/表情系统；用户已有的 Live2D 模型直接可用；API 面非常完整，注入 tracking 参数意味着可以完全用 LLM/TTS 驱动而不用摄像头。",
+        "cons": "用户必须额外装并常驻 VTube Studio，不是一体化产品体验；它是普通 App 窗口，做不到「贴壁纸层」（只能 NDI 或窗口捕获 + 绿幕，macOS 上虚拟摄像头不支持）；macOS 版最低要求写的是 Catalina 10.15.7 + Intel i5，是 Unity 老构建；商业产品依赖闭源第三方风险高。",
+        "maturity": "production-ready",
+        "cost": "钱：0（去水印 ¥1,520 一次性）。工程：接 API 约 2-3 天。"
+      },
+      {
+        "name": "3D VRM 路线：抄 Desktop Mate / MateEngine（并注意它已是 Mac 上的直接竞品）",
+        "how": "Desktop Mate（Steam app 3301060，infiniteloop 出品，2025-01-07 首发）本体免费 + 角色 DLC ¥2,200/个（已 39+ 款，含初音未来、Hello Kitty），**系统要求页已列 macOS Tahoe + Apple Silicon（M1 及以上，8GB RAM，500MB）**，Intel Mac 明确不支持。开源对标是 shinyflvre/Mate-Engine（3,546⭐，Unity/ShaderLab，支持任意 VRM 导入，最后 push 2026-01-20），另有 Marksonthegamer 的 Linux port（291⭐）。VRM 渲染栈在 Web 侧是 pixiv/three-vrm（2,109⭐，MIT，2026-08 仍活跃）。",
+        "pros": "3D VRM 比 Live2D 更接近「转头/呼吸」这类三维微动作，也更容易做换装（VRM 本身有服装分层）；three-vrm 是 MIT 且活跃维护；Desktop Mate 的「角色 DLC 付费」是已被市场验证的变现模型。",
+        "cons": "Desktop Mate 已经在 macOS 上了，akari 若走同一路线是正面竞争；MateEngine 是 Unity 项目，塞进 macOS 原生 App 代价大；VRM 是卡通渲染生态，同样达不到「写实风」。",
+        "maturity": "production-ready",
+        "cost": "钱：0（研究）。工程：如果走 three-vrm + WKWebView，起步约 1-2 周。"
+      },
+      {
+        "name": "写实风：视频循环为主 + 实时驱动为辅（LivePortrait / MuseTalk / EchoMimic）",
+        "how": "参考效果里的「写实风 2560×1440 60fps 呼吸/转头/眨眼」在技术上几乎肯定是**预渲染视频循环**（Wallpaper Engine 的 video wallpaper），不是实时驱动。真要做实时写实驱动，现有开源选项：KlingAIResearch/LivePortrait（18,936⭐，原 KwaiVGI 迁移过来，2026-06 更新，做整脸可控驱动，现代 GPU 上接近实时）、TMElyralab/MuseTalk（6,425⭐，潜空间 inpainting 做实时唇同步，但 2025-09 后停更）、antgroup/echomimic（4,285⭐，Apache-2.0，AAAI 2025，可编辑 landmark 条件的音频驱动肖像动画）。务实方案：用视频生成模型离线产出一套 idle / 转头 / 眨眼 / 说话 的 60fps 循环片段，运行时做状态机切片播放 + 交叉淡入；只在「说话」这一段用 MuseTalk 类模型做嘴部区域实时重绘。",
+        "pros": "离线预渲染能真的做到 2K60，画质上限由生成模型决定而不是渲染器；状态机切片播放在 macOS 上就是 AVPlayer + AVQueuePlayer，性能几乎零成本；换装 = 换一套素材包，商业模型清晰。",
+        "cons": "完全没有实时表情/口型自由度，除非叠 MuseTalk；LivePortrait 是 NOASSERTION（非标准许可，商用需逐条读）、MuseTalk 同样 NOASSERTION 且已停更；这几个模型都是 CUDA 生态，在 Apple Silicon 上要自己移植到 MLX/CoreML，工作量很大且未必达到实时。",
+        "maturity": "experimental",
+        "cost": "钱：离线渲染算力（用云 GPU 生成素材，几十到几百美元）。工程：视频状态机 1 周；实时唇同步移植到 Mac 属于研究性投入，2-3 个月且有失败风险。"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "Open-LLM-VTuber/Open-LLM-VTuber：13,329 stars，1,576 forks，Python，LICENSE 文件为 MIT（GitHub API 报 NOASSERTION，因仓库内含另有授权的 Live2D 示例模型），最后一次 commit 2026-05-15（内容只是修 README badge），上一条实质提交 2026-02-11，最后 release v1.2.1 发布于 2025-08-26",
+        "source_url": "https://github.com/Open-LLM-VTuber/Open-LLM-VTuber",
+        "confidence": "high"
+      },
+      {
+        "fact": "Open-LLM-VTuber 支持的 ASR 后端：sherpa-onnx、FunASR、Faster-Whisper、Whisper.cpp、Whisper、Groq Whisper、Azure ASR",
+        "source_url": "https://github.com/Open-LLM-VTuber/Open-LLM-VTuber",
+        "confidence": "high"
+      },
+      {
+        "fact": "Open-LLM-VTuber 支持的 TTS 后端：sherpa-onnx、pyttsx3、MeloTTS、Coqui-TTS、GPT-SoVITS、Bark、CosyVoice、Edge TTS、Fish Audio、Azure TTS",
+        "source_url": "https://github.com/Open-LLM-VTuber/Open-LLM-VTuber",
+        "confidence": "high"
+      },
+      {
+        "fact": "Open-LLM-VTuber 支持的 LLM 后端：Ollama、OpenAI 及兼容 API、Gemini、Claude、Mistral、DeepSeek、智谱 AI、GGUF、LM Studio、vLLM；Qwen 在 config_templates/conf.ZH.default.yaml 中有现成配置项",
+        "source_url": "https://github.com/Open-LLM-VTuber/Open-LLM-VTuber",
+        "confidence": "high"
+      },
+      {
+        "fact": "Open-LLM-VTuber 要求 Python >= 3.10 且 < 3.13，官方推荐用 uv 管理依赖（brew install uv），并需要 git 与 ffmpeg",
+        "source_url": "http://docs.llmvtuber.com/docs/quick-start",
+        "confidence": "high"
+      },
+      {
+        "fact": "Open-LLM-VTuber 的桌面客户端在独立仓库 Open-LLM-VTuber/Open-LLM-VTuber-Web（TypeScript/Electron，174 stars，最后 push 2025-09-05），桌宠模式实现为「透明背景 + 全局置顶 + 鼠标点击穿透」",
+        "source_url": "https://github.com/Open-LLM-VTuber/Open-LLM-VTuber-Web",
+        "confidence": "high"
+      },
+      {
+        "fact": "Open-LLM-VTuber 官方说明：长期记忆功能已被「临时移除」；v2.0 是「代码库完全重写」且处于早期规划阶段，v1 的功能请求已不再受理",
+        "source_url": "https://github.com/Open-LLM-VTuber/Open-LLM-VTuber",
+        "confidence": "high"
+      },
+      {
+        "fact": "moeru-ai/airi：48,060 stars，4,760 forks，TypeScript，MIT License，最后 push 2026-08-18（日更节奏）；最新 release v0.11.3 发布于 2026-07-18，产物含 AIRI-0.11.3-darwin-arm64.dmg / darwin-x64.dmg / arm64-mac.zip / android.apk / flatpak / deb / rpm",
+        "source_url": "https://github.com/moeru-ai/airi",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 的 macOS 安装方式是 brew install --cask airi（无需自定义 tap）",
+        "source_url": "https://github.com/moeru-ai/airi",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 桌面端 app 名为 stage-tamagotchi，是 Electron（含 electron-builder.config.ts、electron.vite.config.ts），不是 Tauri（历史上从 Tauri 迁移过来）",
+        "source_url": "https://github.com/moeru-ai/airi/tree/main/apps/stage-tamagotchi",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI monorepo 的渲染包按形象类型拆分：packages/stage-ui-live2d、stage-ui-mmd、stage-ui-spine、stage-ui-tachie（立绘）、stage-ui-three；另有 model-driver-lipsync、model-driver-mediapipe、memory-pgvector、drizzle-duckdb-wasm、electron-screen-capture、audio-pipelines-transcribe、plugin-sdk-tamagotchi",
+        "source_url": "https://github.com/moeru-ai/airi/tree/main/packages",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI stage-tamagotchi 的主进程按窗口职责拆成：main、desktop-overlay、spotlight、caption、widgets、onboarding 六类窗口（src/main/windows/ 下各一个目录）",
+        "source_url": "https://github.com/moeru-ai/airi/tree/main/apps/stage-tamagotchi/src/main/windows",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 的透明窗口配置（src/main/windows/shared/window.ts）：{ frame: false, titleBarStyle: isMacOS ? 'hidden' : undefined, transparent: true, hasShadow: false }；另有 blurryWindowConfig 用 vibrancy: 'hud' + backgroundMaterial: 'acrylic'",
+        "source_url": "https://raw.githubusercontent.com/moeru-ai/airi/main/apps/stage-tamagotchi/src/main/windows/shared/window.ts",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 内含 services/computer-use-mcp：面向 macOS 的电脑控制 MCP 服务。executor 模式为 dry-run（默认，不注入输入）/ macos-local（主力后端）/ linux-x11（遗留实验）。macos-local 用 NSWorkspace + CGWindowList 做窗口观察，用 Swift + Quartz CGEvent 注入输入，用 open -a 与 activate 做 App 打开/聚焦",
+        "source_url": "https://raw.githubusercontent.com/moeru-ai/airi/main/services/computer-use-mcp/README.md",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI computer-use-mcp 的工具面：desktop_get_capabilities / desktop_observe_windows / desktop_screenshot / desktop_open_app / desktop_focus_app / desktop_click / desktop_type_text / desktop_press_keys / desktop_scroll / desktop_wait；terminal_exec / terminal_get_state / terminal_reset_state；secret_read_env_value / clipboard_read_text / clipboard_write_text；browser_agent_run、browser_dom_read_page / find_elements / click / set_input_value / select_option / wait_for_element 等；desktop_list_pending_actions / desktop_approve_pending_action / desktop_reject_pending_action / desktop_get_session_trace",
+        "source_url": "https://raw.githubusercontent.com/moeru-ai/airi/main/services/computer-use-mcp/README.md",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 的桌面覆盖层（desktop-overlay）是全屏透明、click-through（setIgnoreMouseEvents）、不进 Dock/任务栏的窗口，由环境变量 AIRI_DESKTOP_OVERLAY=1 开关，renderer 轮询 computer_use::desktop_get_state 而非主进程 IPC 推送",
+        "source_url": "https://raw.githubusercontent.com/moeru-ai/airi/main/apps/stage-tamagotchi/src/main/windows/desktop-overlay/index.ts",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 服务端已内置阿里云 DashScope CosyVoice TTS 适配器：server/apps/api/src/services/adapters/tts/dashscope-cosyvoice.ts",
+        "source_url": "https://github.com/moeru-ai/airi/blob/main/server/apps/api/src/services/adapters/tts/dashscope-cosyvoice.ts",
+        "confidence": "high"
+      },
+      {
+        "fact": "AIRI 的 LLM provider 通过自研 SDK moeru-ai/xsai（649⭐，MIT）接入，README 明确列出 Qwen 为受支持 provider 之一，另含 OpenAI、Azure OpenAI、Anthropic、DeepSeek、Gemini、xAI、Groq、Mistral、Cloudflare Workers AI、Together、Fireworks、vLLM、Ollama、SGLang",
+        "source_url": "https://github.com/moeru-ai/airi",
+        "confidence": "high"
+      },
+      {
+        "fact": "macOS 壁纸层的具体写法：NSWindow.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(CGWindowLevelKey(rawValue: 2)!)))，其中 kCGDesktopWindowLevelKey = 2（图标之下）、kCGDesktopIconWindowLevelKey = 18（+1 可盖住图标）；配 collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]",
+        "source_url": "https://github.com/Aperturesurvivor/universe-screen/blob/main/Sources/UI/WallpaperWindowController.swift",
+        "confidence": "high"
+      },
+      {
+        "fact": "Desktop Mate（Steam app id 3301060，infiniteloop Co., Ltd. 出品，2025-01-07 发布）本体免费，角色 DLC ¥2,200/个（个别 ¥1,100），已上架 39+ 款官方授权角色；系统要求明确列出 macOS Tahoe + Apple Silicon（M1 及以上，8GB RAM，500MB 空间），Intel Mac 不支持，Linux 不支持",
+        "source_url": "https://store.steampowered.com/app/3301060/Desktop_Mate/",
+        "confidence": "high"
+      },
+      {
+        "fact": "MateEngine（shinyflvre/Mate-Engine）：Desktop Mate 的开源替代，3,546 stars，Unity/ShaderLab，支持自定义 VRM，最后 push 2026-01-20；另有 Linux port（Marksonthegamer/Mate-Engine-Linux-Port，291⭐）",
+        "source_url": "https://github.com/shinyflvre/Mate-Engine",
+        "confidence": "high"
+      },
+      {
+        "fact": "VTube Studio（DenchiSoft，Steam app 1325860）在 Windows 和 macOS 上均免费；去水印 DLC ¥1,520，多人协作 DLC ¥2,300，NVIDIA Broadcast DLC 免费；macOS 最低要求 Catalina 10.15.7 / Intel Core i5 / 4GB RAM / 2GB VRAM；macOS 上不支持虚拟摄像头，只能用 NDI 或窗口捕获+绿幕",
+        "source_url": "https://store.steampowered.com/app/1325860/VTube_Studio/",
+        "confidence": "high"
+      },
+      {
+        "fact": "VTube Studio Public API：WebSocket，默认 ws://localhost:8001（端口可配）；UDP 47779 每 2 秒广播用于服务发现（即使 API 关闭也广播）。认证流程 AuthenticationTokenRequest（附插件名/作者名/128×128 PNG-JPG 图标，用户弹窗授权）→ 拿到 ≤64 字符 token → 之后用 AuthenticationRequest 复用。请求体固定含 apiName: \"VTubeStudioPublicAPI\"、apiVersion: \"1.0\"、requestID、messageType、data",
+        "source_url": "https://github.com/DenchiSoft/VTubeStudio",
+        "confidence": "high"
+      },
+      {
+        "fact": "VTube Studio API 可控项：加载/卸载模型、移动旋转缩放（position X/Y、rotation、size -100~+100）、触发 hotkey、激活表情（fade 0-2 秒）、注入自定义 tracking 参数（set 独占模式 / add 叠加模式，参数名 4-32 字母数字，每插件上限 100 个）、按 ArtMesh 名/标签/编号/组做 color tint、物理强度与风力（基值 0-100，倍率 0-2，覆盖时长 0.5-5 秒）、加载 PNG/JPG/GIF/动画目录/Live2D item 并 pin 到 ArtMesh。官方列出的客户端 SDK：VTubeStudioJS(JS)、VTS-Sharp(C#)、pyvts 与 coovts(Python)、vtubestudio-rs(Rust)、VTS4J(Java)、node-red-contrib-vts",
+        "source_url": "https://github.com/DenchiSoft/VTubeStudio/wiki",
+        "confidence": "high"
+      },
+      {
+        "fact": "Wallpaper Engine 没有 macOS 版，且官方无发布计划；Mac 侧商业替代品为 Backdrop（Cindori）、Wallper、Wallux、Wallpaper Reactor",
+        "source_url": "https://appleinsider.com/inside/macos/best/wallpaper-engine-doesnt-exist-on-mac-but-there-are-alternatives",
+        "confidence": "high"
+      },
+      {
+        "fact": "Plash（sindresorhus/Plash，4,017⭐）已不再开源——仓库只剩 readme.md 和 Stuff 目录，作者说明因 App Store 抄袭者多且社区无贡献而闭源；App Store 上仍免费，当前版本要求 macOS 26",
+        "source_url": "https://github.com/sindresorhus/Plash",
+        "confidence": "high"
+      },
+      {
+        "fact": "macOS 开源 live wallpaper 引擎：thusvill/LiveWallpaperMacOS（919⭐，Objective-C++/SwiftUI/CMake，macOS 14+，仅支持 .mp4/.mov，锁屏不支持视频）；laobamac/MirageWallpaper（115⭐，C++，GPL-3.0，支持 web/video/scene 三类壁纸，2026-08-18 更新）；haren724/wallpaper-player-mac（479⭐，Swift，最后 push 2025-01-16）；Unayung/wallpaper-engine-mac（55⭐，Swift，GPL-3.0）",
+        "source_url": "https://github.com/thusvill/LiveWallpaperMacOS",
+        "confidence": "high"
+      },
+      {
+        "fact": "kiyotakali/Miru：68⭐，Apache-2.0，最后 push 2026-08-12。原生 macOS App（非 Electron）+ Live2D 桌宠覆盖层，配 Flask 后端与 Android 端；AttentionEngine 根据用户活动与情绪决定主动开口；记忆分 projects/people/yourself/topics 四类 + 每日 journal + commitment list，全部存为纯 Markdown；截图分析后即丢弃；LLM 分 vision/chat/memory 三档，各自可配不同 OpenAI 兼容 provider",
+        "source_url": "https://github.com/kiyotakali/Miru",
+        "confidence": "high"
+      },
+      {
+        "fact": "kwindla/macos-local-voice-agents：334⭐，无 LICENSE 文件，最后 push 2025-08-26（已停更）。组合为 Silero VAD + MLX Whisper（STT）+ LM Studio 本地 OpenAI 兼容 LLM + Kokoro TTS（经 mlx-audio）；README 声称在 M 系列 Mac 上「相对强的模型」可达 <800ms 端到端语音延迟",
+        "source_url": "https://github.com/kwindla/macos-local-voice-agents",
+        "confidence": "high"
+      },
+      {
+        "fact": "实时语音 agent 框架三强（2026-08 实测 star）：pipecat-ai/pipecat 14,275⭐ BSD-2-Clause，日更；livekit/agents 13,069⭐ Apache-2.0；TEN-framework/ten-framework 11,061⭐（NOASSERTION）。livekit/agents-js（Node.js 版）仅 903⭐",
+        "source_url": "https://github.com/pipecat-ai/pipecat",
+        "confidence": "high"
+      },
+      {
+        "fact": "本地语音组件 star 与许可（2026-08）：ggml-org/whisper.cpp 53,015⭐ MIT；k2-fsa/sherpa-onnx 14,243⭐ Apache-2.0；snakers4/silero-vad 9,998⭐ MIT；RVC-Boss/GPT-SoVITS 61,022⭐ MIT；fishaudio/fish-speech 32,258⭐ NOASSERTION；SYSTRAN/faster-whisper 24,975⭐ MIT（2025-11 后未更新）；rhasspy/piper 11,279⭐ MIT（2025-08 后未更新）；myshell-ai/MeloTTS 7,581⭐ MIT（2024-12 后停更）",
+        "source_url": "https://github.com/k2-fsa/sherpa-onnx",
+        "confidence": "high"
+      },
+      {
+        "fact": "Qwen 官方语音相关开源仓（2026-08）：QwenLM/Qwen3-TTS 13,009⭐ Apache-2.0（2026-01-21 建仓，支持流式、自由声音设计、声音克隆）；QwenLM/Qwen3-ASR 3,383⭐ Apache-2.0；QwenLM/Qwen3-Omni 3,960⭐ Apache-2.0（端到端全模态、实时语音生成）；QwenLM/Qwen3.8 3,837⭐ Apache-2.0（2026-08-17 更新，当前 LLM 主线）",
+        "source_url": "https://github.com/QwenLM/Qwen3-TTS",
+        "confidence": "high"
+      },
+      {
+        "fact": "QwenAudio/qwen-audio-agent：2,181⭐，Apache-2.0，JavaScript，2026-07-27 建仓，2026-08-18 更新，自述为「实时语音 runtime，让 Agent 持续说话、工作、在场」；搜索结果称其自定义皮肤兼容 Awesome Codex Pet 社区的 pet packs 并支持 Live2D 桌宠伴侣，但该说法未在仓库页直接核实",
+        "source_url": "https://github.com/QwenAudio/qwen-audio-agent",
+        "confidence": "medium"
+      },
+      {
+        "fact": "Live2D Cubism 5 SDK for Native 支持 Metal 渲染器（CubismNativeSamples 内含 Metal 示例工程）；Cubism 5 SDK R5 正式版于 2026-04-02 发布，修复了 Metal 与 OpenGL 的渲染差异",
+        "source_url": "https://github.com/Live2D/CubismNativeSamples",
+        "confidence": "high"
+      },
+      {
+        "fact": "Live2D SDK 发布许可：个人与小规模企业在发布内容时免于签署 Publication License 与付费——但「Expandable Application」（具有显著可扩展性的应用，典型如允许终端用户导入自己 Live2D 模型/做二次创作的工具，VTuber 追踪软件即属此类）**不适用该豁免**，必须经 Live2D 特别审批并签署单独的 Publication License，且需在发布前至少 1 个月完成。SDK 许可页提到年销售额 2,000 万日元的门槛；Live2D 版权 Simple License Plan 页则以年营收 1,000 万日元定义「Business」",
+        "source_url": "https://www.live2d.com/en/sdk/license/",
+        "confidence": "medium"
+      },
+      {
+        "fact": "Web 端 Live2D 渲染库 guansss/pixi-live2d-display：1,491⭐，MIT，但最后 push 是 2024-08-20，已停更；社区在维护 fork pixi-live2d-display-webgal。VRM 侧 pixiv/three-vrm 2,109⭐ MIT，2026-08-10 仍在更新",
+        "source_url": "https://github.com/guansss/pixi-live2d-display",
+        "confidence": "high"
+      },
+      {
+        "fact": "elevenyellow/handcrafted-persona-engine：1,354⭐，C# / .NET 9.0，**Windows x64 + NVIDIA CUDA 12.4 + cuDNN 9.1.1 独占**，macOS/Linux 不支持，最后 push 2026-05-20。ASR 为双 Whisper 管线 + Silero VAD（小模型检测起话做 barge-in，大模型 Large-v3 Turbo 做转写）；TTS 为 Kokoro（快）与 Qwen3（富表现力）双引擎 + espeak-ng 补音素 + 可选 RVC 实时变声；Live2D 模型需按 VBridger 参数规范绑定",
+        "source_url": "https://github.com/elevenyellow/handcrafted-persona-engine",
+        "confidence": "high"
+      },
+      {
+        "fact": "jofizcd/Soul-of-Waifu：1,229⭐，GPL-3.0，Python，**仅 Windows 10/11 64-bit**，最后 push 2026-08-17。支持 Live2D + VRM + 静态图/GIF，28 类情绪分类器；ASR 用 Faster Whisper + Silero VAD；TTS 六选一：Qwen3 TTS（本地，可声音克隆）、XTTSv2、Kokoro 82M、Silero TTS、EdgeTTS、ElevenLabs；LLM 本地走 llama.cpp（CUDA/HIP/SYCL/Vulkan，GGUF），云端支持 OpenRouter/OpenAI/Claude/DeepSeek/Grok/Gemini/Qwen/Mistral；「Soul Companion」是常驻透明覆盖层，含基于神经激素的情绪模拟与自主操控鼠标键盘/浏览器/执行代码",
+        "source_url": "https://github.com/jofizcd/Soul-of-Waifu",
+        "confidence": "high"
+      },
+      {
+        "fact": "morettt/my-neuro：1,335⭐，MIT，Python，2026-08-18 更新，Windows 为主（部署脚本全是 .bat）。TTS 用 GPT-SoVITS，长期记忆基于 MemOS，声称对话延迟 <1 秒；含桌面控制与屏幕视觉，支持替换任意 Live2D 模型",
+        "source_url": "https://github.com/morettt/my-neuro",
+        "confidence": "high"
+      },
+      {
+        "fact": "其他值得看的中文 AI 桌宠：SlimeBoyOwO/LingChat 1,552⭐ AGPL-3.0 Rust；heshengtao/super-agent-party 2,592⭐ AGPL-3.0；BDFFZI/Alife 154⭐ AGPL-3.0 C#（插件化、AI 自主开发插件）；WINDGAND/Bailin 144⭐ MIT TypeScript；TopSea/Alive 94⭐；chyinan/Kokoro-Engine 110⭐ Rust MIT（跨平台虚拟角色引擎）；tegnike/aituber-kit 1,054⭐（Next.js，Live2D + VRM，需 Node ^20）",
+        "source_url": "https://github.com/SlimeBoyOwO/LingChat",
+        "confidence": "high"
+      },
+      {
+        "fact": "macOS 原生 Swift 桌宠（全是像素/简单形象，无 Live2D）：ntd4996/agentpet 325⭐ MIT（macOS+Windows，监控 Claude Code/Codex/Cursor/Gemini 状态）；alterhq/openpets 89⭐ MIT（MCP/CLI 可控的共享桌宠）；bleeeet/TermiPet 85⭐ Apache-2.0；BinaryFroggy/Hopet 62⭐ MIT；jieyefriic/mochi 112⭐ MIT；Wanduforl/MacArkPet 128⭐ GPL-3.0（Ark-Pets 的 macOS 原生仿制）；pixelomer/Shijima-Qt 197⭐ GPL-3.0（Shimeji 运行器）；iuin8/open-pet-agent 1⭐ MIT Swift（可插拔形象：弹力球/史莱姆/Shimeji/Live2D/精灵图 + GPU falling-sand 物理）",
+        "source_url": "https://github.com/ntd4996/agentpet",
+        "confidence": "high"
+      },
+      {
+        "fact": "写实/视频驱动数字人（全部 CUDA 生态）：KlingAIResearch/LivePortrait 18,936⭐ NOASSERTION（仓库已从 KwaiVGI 迁至 KlingAIResearch，2026-06-01 更新）；TMElyralab/MuseTalk 6,425⭐ NOASSERTION（潜空间 inpainting 实时唇同步，2025-09 后停更）；antgroup/echomimic 4,285⭐ Apache-2.0（AAAI 2025）；fudan-generative-vision/hallo3 1,400⭐ MIT（2025-03 后停更）",
+        "source_url": "https://github.com/KlingAIResearch/LivePortrait",
+        "confidence": "high"
+      },
+      {
+        "fact": "AI VTuber 生态的官方 awesome list：proj-airi/awesome-ai-vtubers，485⭐，MIT，最后更新 2026-04-15——AIRI 团队维护，是本领域最省事的入口",
+        "source_url": "https://github.com/proj-airi/awesome-ai-vtubers",
+        "confidence": "high"
+      },
+      {
+        "fact": "参考视频中的「豆宝」产品未能核实。WebSearch（US 区）与 Bilibili 搜索 API 均未找到名为「豆宝」的桌面 AI 虚拟人壁纸产品；搜到的「豆包」是字节跳动的通用 AI 助手（doubao.com，桌面端 v2.11.7），其 AI 视频工具可做动态壁纸但不是虚拟人桌面产品。「AI偶像星光计划」相关搜到的是 B 站的《星光108》AI 女团选秀互动剧（UP 主「星光108」，单集播放 6-9 万），是内容节目而非桌面软件",
+        "source_url": "https://api.bilibili.com/x/web-interface/wbi/search/type?search_type=video&keyword=%E8%B1%86%E5%AE%9D",
+        "confidence": "low"
+      }
+    ],
+    "gotchas": [
+      "**Live2D 的 \"Expandable Application\" 条款是最大的法律地雷**：只要 akari 允许用户导入自己的 Live2D 模型（换装、换角色），就不再享受「个人/小规模企业免签免费」的豁免，必须走 Live2D 特别审批 + 单独的 Publication License，且要求在发布前至少 1 个月完成。这个功能是产品核心卖点之一，必须提前 3 个月启动法务，不能等到上线前。",
+      "**Open-LLM-VTuber 已经不能当活跃底座**：最后一次实质功能提交是 2026-02-11，2026-05-15 那次 commit 只改了 README badge，最后 release v1.2.1 停在 2025-08-26；长期记忆功能被官方标注「临时移除，即将回归」至今未回；v2.0 是「代码库完全重写」的早期规划阶段，v1 的功能请求已不再受理。抄它的设计可以，基于它开发会踩空。",
+      "**写实风 2560×1440 60fps 大概率不是实时驱动**：Live2D 和 VRM 都是二次元卡通渲染，做不出写实。参考视频的效果几乎肯定是预渲染视频循环。真要实时写实驱动，LivePortrait / MuseTalk / EchoMimic 全部是 CUDA 生态，在 Apple Silicon 上没有现成移植，且即便移植成功也远达不到 60fps。这是一个必须在架构启动前拍板的方向性决策，不是可以后补的实现细节。",
+      "**macOS 壁纸层不是公开 API**：kCGDesktopWindowLevelKey（值 2）能用，但没有 Apple 的兼容性承诺，每个大版本都可能变；App Store 沙盒下基本不可用（Plash 是特例且已闭源）；多显示器原点非零、Space 切换、Stage Manager、全屏 App 覆盖、锁屏这几种情况都要单独处理。桌面图标层是 kCGDesktopIconWindowLevelKey（值 18），要盖住图标需 +1。",
+      "**权限组合会把 App Store 路堵死**：电脑控制需要「辅助功能」权限（CGEvent 注入）、屏幕理解需要「屏幕录制」权限、语音需要麦克风权限。这三样加在一起，App Store 审核几乎不可能全过，实际只能走 Developer ID 直接分发 + 公证（notarization）。变现模型要据此设计，不能指望 App Store 内购。",
+      "**商业竞品已经在 Mac 上了**：Desktop Mate（infiniteloop）的 Steam 系统要求页已明确列出 macOS Tahoe + Apple Silicon，本体免费 + ¥2,200/角色 DLC，已有 39+ 款官方授权 IP。akari 如果走 3D VRM 桌宠路线，是正面撞上一个有版权 IP 弹药库的对手。",
+      "**中文桌宠的强项目全部 Windows + CUDA 独占，代码一行都跑不了**：Soul-of-Waifu（GPL-3.0，Windows 10/11 only）、handcrafted-persona-engine（.NET 9 + CUDA 12.4，明确不支持 macOS/Linux）、my-neuro（部署全是 .bat）。它们的 TTS/ASR/情绪分类设计值得读，但别指望移植——移植成本约等于重写。",
+      "**许可传染风险**：MirageWallpaper、MacArkPet、Shijima-Qt 是 GPL-3.0，LingChat、super-agent-party、Alife 是 AGPL-3.0，Soul-of-Waifu 是 GPL-3.0——这些只能读设计、不能抄代码进闭源产品。LivePortrait 和 MuseTalk 是 NOASSERTION（非标准自定义许可），商用前必须逐条读原文。可安全直接用的是 AIRI（MIT）、Miru（Apache-2.0）、three-vrm（MIT）、sherpa-onnx（Apache-2.0）、silero-vad（MIT）、whisper.cpp（MIT）。",
+      "**kwindla/macos-local-voice-agents 已停更近一年**（最后 push 2025-08-26，且无 LICENSE 文件）。Pipecat 这一年 API 变动很大（日更节奏），照着 README 直接跑基本会报错。它的价值是「组件选型清单 + 延迟基准」而不是「可运行代码」。另外它没有 LICENSE 文件，严格说是保留所有权利，不能直接复制代码。",
+      "**pixi-live2d-display 已停更**（最后 push 2024-08-20），如果走 Web 渲染路线，Cubism 5.3 的新特性可能不支持；且 Live2D Cubism Core 本身是闭源二进制，无法审计也无法自己修 bug。原生路线（Cubism 5 SDK for Native + Metal，R5 正式版 2026-04-02 发布）反而更可控。",
+      "**AIRI 虽然是最佳参考，但整体 fork 是陷阱**：monorepo 极大（TypeScript 约 9.3MB 源码 + Vue 2.7MB），日更节奏意味着 fork 后 rebase 成本极高；且它的形象渲染是 Web/WebGL 路线（stage-ui-live2d 等），与 akari 若要做原生 Metal 渲染的方向不兼容。正确姿势是「按包窃取」——只拿 services/computer-use-mcp 和窗口分层设计，不要 fork 整仓。",
+      "**VTube Studio 的 macOS 版是老 Unity 构建**（最低要求写的是 Catalina 10.15.7 + Intel Core i5），且 macOS 上不支持虚拟摄像头。用它的 API 驱动可以省掉全部渲染工作，但代价是用户必须额外常驻一个第三方 App，并且做不到「贴壁纸层」——它只是一个普通窗口。",
+      "**GitHub API 返回的 license 字段会骗人**：Open-LLM-VTuber 的 API 返回 NOASSERTION，但仓库 LICENSE 文件实际是标准 MIT（Copyright 2025 Yi-Ting Chiu）——NOASSERTION 是因为仓库内含另有授权条款的 Live2D 示例模型。反过来也一样，看到 API 报某个 SPDX ID 也要打开 LICENSE 确认。",
+      "**「豆宝」这个产品无法核实**，请让提出的人补充来源（截图里的 App 名 / 官网 / 应用商店链接 / 视频 URL）。US 区 WebSearch 和 Bilibili 搜索 API 都查不到同名的桌面 AI 虚拟人壁纸产品；搜到的「豆包」是字节的通用 AI 助手，「AI偶像星光计划」最接近的是 B 站的《星光108》AI 女团选秀互动剧（内容节目，非软件）。在核实之前不要把它当作产品基准。",
+      "**Wallpaper Engine 永远不会有 Mac 版**，别把「移植 Wallpaper Engine 壁纸包」写进方案。想复用它的素材生态只能自己解析 .pkg 格式（Unayung/wallpaper-engine-mac 做了部分，55⭐，GPL-3.0）。"
+    ]
+  },
+  "voice-pipeline": {
+    "topic": "akari 桌面 AI 虚拟女友 —— 实时语音对话流水线工程细节（延迟预算 / VAD 端点 / barge-in 与 AEC / 唤醒词 / 流式串联 / 框架选型 / macOS 音频 I/O）",
+    "summary": "结论先行：这条链路上最贵的不是模型，是「什么时候算用户说完」和「AI 自己的声音进了麦克风」这两件事。2026 年模型延迟已不是瓶颈，端点检测策略和回声消除才决定 akari 像不像人，也是最容易做砸的两处。\n\n延迟预算（用户说完最后一个字 → 听到第一个音）。云端级联现实可达 p50 650–900ms：端点判定 200–500ms（最大头）、流式 ASR 收尾 100–200ms、LLM TTFT 200–400ms、TTS 首包 100–300ms、播放抖动缓冲 50–100ms。走 Qwen Omni Realtime 端到端语音模型可压到 400–800ms。纯本地 Mac 有 Apple 自己论文的硬数据：ChipChat 在 M2 Ultra Mac Studio 全本地级联总计约 920ms（不含端点静默等待），其中 ASR 175ms、LLM 状态推理 560ms 是大头；kwindla 的 pipecat macOS 样例宣称 M 系列 <800ms voice-to-voice。行业共识：把静默阈值从 800ms 降到 200ms 省下的 600ms，比换任何模型都值钱——这要靠语义端点模型（smart-turn v3，CPU 12ms 推理、约 8M 参数、BSD-2）而不是靠调 VAD 阈值。\n\nVAD 选型。Silero VAD 6.2.1（MIT，2MB，30ms 块 <1ms CPU）胜在通用，但官方对比显示它在「语音→静音」转换上慢几百毫秒，直接拿它做端点等于白送延迟。TEN VAD（Apache-2.0，macOS arm64 预编译 731KB，M1 上 RTF 0.016，10/16ms hop）转换更快更省。推荐组合：TEN VAD 做帧级门控 + smart-turn v3 做语义端点。\n\nAEC 是最大的坑。macOS 只有一条真正可用的路：kAudioUnitSubType_VoiceProcessingIO / AVAudioInputNode.setVoiceProcessingEnabled(true)。但它有三个硬伤：输入输出设备不一致（AirPods 麦 + 内置扬声器）会直接失败（err -10875，AggregateDevice 声道数不匹配，Apple 论坛无人回复）；它会把全机音频切进「通话模式」，别的 App 音乐被 duck；TTS 音频必须从同一个 engine 的 output 节点播出去，否则 AEC 拿不到参考信号、完全失效。最省事的绕法是把 UI 做成 Chromium（Electron）里的 WebView，用 getUserMedia({echoCancellation:true}) 白嫖 AEC3——pipecat 官方 macOS 本地样例正是这么做的（SmallWebRTCTransport + 浏览器客户端）。注意 Tauri 在 macOS 上是 WKWebView，没有 AEC3。\n\n唤醒词建议直接跳过。openWakeWord 误唤醒 8.5 次/小时（LiveKit 实测），一个 24h 挂桌面的角色会随机自言自语。v1 用「按住热键说话 / 点角色开始听」，成本为零、体验可控；真要唤醒词，用 livekit-wakeword（0.08 FPPH、86% recall、自训练一条命令）或 Porcupine（免费档 3 活跃用户/月）。\n\n框架。Pipecat 1.7.0（2026-08-01，Python ≥3.11）是唯一同时具备 qwen extra（QwenLLMService，默认打 DashScope 国际站）、mlx-whisper/kokoro/silero 本地 extra、以及现成 macOS 全本地样例的框架，首选。LiveKit Agents 适合多端/远程；TEN Framework 强在 WebRTC + 可视化编排（TEN VAD 就是他们出的）；Vocode 已被评为停滞，别用。",
+    "options": [
+      {
+        "name": "A. Electron/Chromium 外壳 + Pipecat(Python) 本地进程 —— 推荐作 akari v1 主干",
+        "how": "渲染层用 Electron 的 Chromium 承载角色渲染（WebGL/视频层）并同时充当音频前端：getUserMedia({echoCancellation:true, noiseSuppression:true, autoGainControl:false}) 拿到已 AEC 的麦克风流，TTS 音频也通过同一个页面的 WebAudio 播放，AEC3 的参考信号天然对齐。音频经 WebRTC（pipecat 的 SmallWebRTCTransport，本地 serverless P2P）送给同机 Python 进程；Python 侧跑 pipecat 1.7.0 管道：SileroVADAnalyzer 或 TEN VAD → LocalSmartTurnAnalyzerV3（smart-turn v3 ONNX）→ ASR（云 qwen3-asr-flash-realtime 或本地 MLXWhisper/Parakeet）→ QwenLLMService（DashScope）→ TTS（qwen3-tts-flash-realtime 或本地 Kokoro-MLX）。分句用 TextAggregationMode.SENTENCE，中文标点要自己补全角正则。打断用 PipelineTask(allow_interruptions=True)。",
+        "pros": "AEC 白嫖 Chromium AEC3，零自研；pipecat 官方 macOS 样例即此架构，踩坑最少；本地/云可逐组件替换（先全云跑通再换本地）；Qwen 有官方 service 类；角色渲染和音频在同一进程，口型/表情同步好做。",
+        "cons": "多进程（Electron + Python）打包、签名、TCC 权限继承麻烦；Electron 常驻内存大（对 2560x1440 60fps 壁纸场景要额外调 GPU 合成）；Electron 的 echoCancellation 有已确认 bug（#47043，Windows ARM64 复现，closed as not planned），macOS 上必须亲自实测；Python 侧首启动要下模型 30s+。",
+        "maturity": "production-ready",
+        "cost": "钱：云端全走 Qwen 约 ¥0.1–0.3/10 分钟对话（qwen3.5-flash $0.1/$0.4 每百万 token + ASR $0.000035/秒 + TTS $15/百万字符）；工程：2–3 周做到可用，主要成本在打包签名和中文分句调优。"
+      },
+      {
+        "name": "B. 纯 Swift 原生（AVAudioEngine + VoiceProcessingIO + macOS 26 Speech 框架）",
+        "how": "Swift 6.3 单进程：AVAudioEngine 打开 setVoiceProcessingEnabled(true) 同时拿 AEC/NS/AGC，TTS PCM 从同一 engine 的 mainMixerNode 播出保证参考信号有效；ASR 用 macOS 26 的 SpeechAnalyzer + SpeechTranscriber（全设备端、AsyncSequence 流式）或 FluidAudio（Swift Package，Parakeet TDT v3 0.6b CoreML，跑 ANE）；VAD 用 SpeechDetector 或 TEN VAD 的 macOS arm64 静态库；LLM/TTS 打 DashScope WebSocket；角色渲染直接 Metal/SpriteKit 贴桌面窗口层。",
+        "pros": "单进程、启动快、内存小、功耗最低（CoreML 走 ANE）；分发就是一个 .app，签名公证一条龙；SpeechAnalyzer 完全离线不花钱；最适合「常驻桌面」这个形态。",
+        "cons": "VoiceProcessingIO 的设备不匹配崩溃必须自己兜（AirPods 切换是高频场景）；它会 duck 全机音频，不说话时必须关掉 voice processing 再重建 engine；没有现成 pipeline 框架，打断/分句/状态机全自研；Qwen realtime WebSocket 协议要自己实现（DashScope 无官方 Swift SDK）。",
+        "maturity": "usable",
+        "cost": "钱：同 A；工程：4–6 周，AEC 状态机和设备切换处理是主要风险点。"
+      },
+      {
+        "name": "C. Qwen Omni Realtime 端到端语音（qwen3.5-omni-flash-realtime）",
+        "how": "客户端只做三件事：采音（必须自己 AEC）、WebSocket 推 16kHz PCM16、播 24kHz PCM 输出。连 wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime（或 wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime），session 配 turn_detection: {type:'semantic_vad', threshold:0.5, silence_duration_ms:800, prefix_padding_ms:...}。打断靠监听 input_audio_buffer.speech_started 后发 response.cancel 并清空本地播放队列。",
+        "pros": "延迟最低（400–800ms）、保留语气情绪、无需自建 ASR/TTS/分句；semantic_vad 能识别语义意图、不被「嗯」「对」这类附和打断；55 种音色含方言，人设可调。",
+        "cons": "AEC 仍然要自己做（服务端 VAD 帮不了你，AI 的声音会被当用户输入传上去）；贵——音频输入 $4.5/百万 token、输出 $17.7/百万 token，长时间陪伴场景成本失控；无法离线；工具调用/控制电脑的能力弱于纯文本 LLM；音色/人格定制受限于服务端。",
+        "maturity": "production-ready",
+        "cost": "钱：明显高于级联，连续对话每小时数美元量级；工程：1–2 周（协议简单），但 AEC 那部分与 A/B 相同。"
+      },
+      {
+        "name": "D. 全本地 MLX 级联（隐私优先 / 离线可用）",
+        "how": "Pipecat + MLX：VAD Silero/TEN → smart-turn v3 → MLX Whisper 或 parakeet-mlx（Apple Silicon 原生流式 ASR）→ 本地 Qwen3 via MLX-LM/LM Studio（OpenAI 兼容端点）→ Kokoro TTS（mlx-audio）。ChipChat 论文验证了这条路在 Mac 上可做到亚秒。",
+        "pros": "零 API 费用、完全离线、隐私（虚拟女友场景的对话内容非常敏感）；断网也能陪你；mlx-audio 已支持 Kokoro / Qwen3-TTS / Parakeet / Whisper 全家桶。",
+        "cons": "常驻显存/内存吃紧（LLM + ASR + TTS 同时驻留，4B 模型起步 ~6–8GB，和 2560x1440 60fps 渲染抢带宽）；发热和风扇噪音直接伤害「桌面伴侣」体验；本地小模型的 agent/工具调用能力明显弱；Kokoro 中文音色质量不如 Qwen TTS。",
+        "maturity": "usable",
+        "cost": "钱：$0；工程：2–3 周，但持续调优（模型量化、内存驻留策略）成本高。"
+      },
+      {
+        "name": "E. 按住热键说话（PTT）—— 建议无论选哪个主干都先做这一层",
+        "how": "全局热键（fn / 右 Option 长按）或点击角色触发录音；按下时才 startEngine、松开即 commit。DashScope 的 qwen3-asr-flash-realtime 支持 turn_detection: null + input_audio_buffer.commit 手动模式，正好对应。",
+        "pros": "完全绕开唤醒词误触发、常驻功耗、以及绝大部分 AEC 复杂度（按住时可以直接把 TTS 静音/暂停，不存在双讲）；延迟最低（无端点等待，省 200–500ms）；一天就能做完，能立刻验证 LLM/人设/TTS 的效果。",
+        "cons": "不「自然」，不能真正做到随时搭话；barge-in 语义变成「按键即打断」；长期看仍要补上开放麦模式。",
+        "maturity": "production-ready",
+        "cost": "钱：$0；工程：1–2 天。"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "Apple 官方论文 ChipChat 实测：M2 Ultra Mac Studio（192GB，2023）全本地流式级联，累计延迟 ~920ms（不含端点静默等待）。分解：Mel 11ms → ASR 165–175ms（等 16 帧 160ms + 推理 13ms）→ LLM 状态推理 ~560ms → LLM 首 token 后 ~576ms → TTS（等 5 个词后启动）~880ms → Vocoder ~920ms → 播放器 0.2ms。论文明确指出：未做流式优化的 PyTorch 朴素实现延迟 >4s。",
+        "confidence": "high",
+        "source_url": "https://arxiv.org/abs/2509.00078"
+      },
+      {
+        "fact": "ChipChat 的打断机制：ASR 检测到非静音 token 立刻向所有下游组件发中断信号；音频播放器回传「被打断时正在播哪个 n-gram」给 LLM，LLM 据此清理 KV cache 中已生成但未发声的内容。TTS 分句策略是监测句末标点 (.!?)，完成当前句后清 KV cache。",
+        "confidence": "high",
+        "source_url": "https://arxiv.org/abs/2509.00078"
+      },
+      {
+        "fact": "pipecat-ai 当前版本 1.7.0，发布于 2026-08-01，要求 Python >=3.11。相关 extras 名称：local、mlx-whisper、whisper、qwen、silero、livekit、kokoro。",
+        "confidence": "high",
+        "source_url": "https://pypi.org/project/pipecat-ai/"
+      },
+      {
+        "fact": "Pipecat 有官方 QwenLLMService（pipecat.services.qwen.llm），继承 OpenAILLMService，默认 base_url 指向 DashScope 国际站的 OpenAI 兼容端点。",
+        "confidence": "high",
+        "source_url": "https://docs.pipecat.ai/api-reference/server/services/llm/qwen"
+      },
+      {
+        "fact": "kwindla/macos-local-voice-agents 官方 macOS 全本地样例：Silero VAD + smart-turn v2 + MLX Whisper + Gemma3n 4B + Kokoro TTS，Python 3.12，客户端是 React（voice-ui-kit）通过 SmallWebRTCTransport 本地 serverless WebRTC 连接；README 称 M 系列 Mac 可达 voice-to-voice <800ms。AEC 未在文档中提及——它实际上来自浏览器 WebRTC 栈。",
+        "confidence": "high",
+        "source_url": "https://github.com/kwindla/macos-local-voice-agents"
+      },
+      {
+        "fact": "smart-turn v3（pipecat-ai/smart-turn-v3）：原生音频语义端点检测模型，~8M 参数，8MB int8 ONNX，纯 CPU 推理 12ms（低配 AWS 实例 60ms），支持 23 种语言，BSD-2 许可，权重/训练数据/训练脚本全开源。Pipecat 中通过 LocalSmartTurnAnalyzerV3 使用。",
+        "confidence": "high",
+        "source_url": "https://www.daily.co/blog/announcing-smart-turn-v3-with-cpu-inference-in-just-12ms/"
+      },
+      {
+        "fact": "Silero VAD 当前版本 6.2.1（2026-02-24 发布），MIT 许可，JIT 模型约 2MB，30ms+ 音频块 CPU 推理 <1ms，支持 8000/16000 Hz。v6.2.1 起 onnxruntime 改为可选依赖。pip install silero-vad。",
+        "confidence": "high",
+        "source_url": "https://pypi.org/project/silero-vad/"
+      },
+      {
+        "fact": "TEN VAD：Apache-2.0（含附加条件，含 LPCNet 的 BSD-2/BSD-3 代码），支持 macOS arm64/x86_64 预编译库（macOS 库 731KB），16kHz 输入，hop 可配 160/256 samples（10/16ms），M1 上 RTF 0.0160，WASM 在 M1 上 RTF 0.010。官方对比称其在「语音→非语音」转换检测上比 Silero 快数百毫秒，且计算量与体积更小。pip 包名 ten-vad。",
+        "confidence": "high",
+        "source_url": "https://github.com/TEN-framework/ten-vad"
+      },
+      {
+        "fact": "DashScope Qwen Omni Realtime 模型 ID：qwen3.5-omni-plus-realtime、qwen3.5-omni-flash-realtime、qwen3-omni-flash-realtime。WebSocket：新加坡 wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime，北京 wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime。输入 16kHz PCM，输出 24kHz PCM。turn_detection 支持 server_vad 与 semantic_vad（后者对 qwen3.5-omni-realtime 推荐，参数 threshold 建议 0.5、silence_duration_ms 建议 800、prefix_padding_ms）。打断通过 input_audio_buffer.speech_started 事件 + 客户端发 response.cancel。",
+        "confidence": "high",
+        "source_url": "https://www.alibabacloud.com/help/en/model-studio/realtime"
+      },
+      {
+        "fact": "DashScope 实时 ASR 模型 ID：qwen3-asr-flash-realtime、fun-asr-realtime、paraformer-realtime-8k-v2。Qwen-ASR 走 /api-ws/v1/realtime，其余走 /api-ws/v1/inference。turn_detection 默认 server_vad（silence_duration_ms 默认 400，可调）；设为 null 则改为客户端手动 input_audio_buffer.commit——这正是「按住热键说话」需要的模式。",
+        "confidence": "high",
+        "source_url": "https://www.alibabacloud.com/help/en/model-studio/qwen-real-time-speech-recognition"
+      },
+      {
+        "fact": "DashScope 实时 TTS 模型 ID：qwen3-tts-flash-realtime、qwen3-tts-instruct-flash-realtime、qwen-audio-3.0-tts-flash、qwen-audio-3.0-tts-plus、cosyvoice-v3.5-flash/plus、cosyvoice-v3-flash/plus、cosyvoice-v2。双向 WebSocket 流式，输出 PCM/WAV/MP3/Opus 最高 48kHz（示例用 PCM_24000HZ_MONO_16BIT）。音色示例：Cherry、longanlingxi、longanyang、longanhuan_v3。",
+        "confidence": "high",
+        "source_url": "https://www.alibabacloud.com/help/en/model-studio/realtime-tts-user-guide"
+      },
+      {
+        "fact": "Qwen3-TTS-Flash 官方宣称单线程首包延迟低至 97ms（Dual-Track 混合流式生成架构）；Qwen-Audio-3.0-TTS Flash 的首包延迟报道为约 200–300ms。这两个数字来源不同、口径可能不同，实际以自测为准。",
+        "confidence": "medium",
+        "source_url": "https://qwenlm-qwen3-tts.mintlify.app/guides/streaming"
+      },
+      {
+        "fact": "DashScope 国际站定价（新加坡）：qwen3-omni-flash-realtime 音频输入 $4.57/百万 token、输出（文本+音频）$18.13/百万 token；qwen3.5-omni-flash-realtime $4.5 / $17.7 每百万 token；qwen3.5-flash 文本 $0.1 输入 / $0.4 输出 每百万 token。新用户每个模型 100 万 token 免费额度，有效期 90 天，仅国际（新加坡）站。",
+        "confidence": "medium",
+        "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+      },
+      {
+        "fact": "qwen3-asr-flash 定价 $0.000035/秒（约 $0.126/小时音频），支持 11 种语言含粤语/四川话/闽南语/吴语。Qwen-Audio-3.0-TTS Flash 定价 $15/百万字符。",
+        "confidence": "medium",
+        "source_url": "https://openrouter.ai/qwen/qwen3-asr-flash-2026-02-10"
+      },
+      {
+        "fact": "macOS AEC 的唯一系统方案是 kAudioUnitSubType_VoiceProcessingIO；Swift 侧通过 AVAudioEngine 的 inputNode.setVoiceProcessingEnabled(true) 开启，输入输出节点会自动同时进入 voice processing 模式，支持最高 48kHz。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2023/10235/"
+      },
+      {
+        "fact": "已知严重缺陷：AVAudioEngine voice processing 在输入/输出设备不一致时失败（如 AirPods 麦 + MacBook 内置扬声器 → err -10875 'client-side input and output formats do not match'、AggregateDevice.mm 声道数断言失败、err 560227702）。同设备（内置麦 + 内置扬声器）正常。Apple 开发者论坛该帖 0 回复、无官方回应。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/forums/thread/810129"
+      },
+      {
+        "fact": "Chrome/Chromium 在 macOS 上默认使用软件 AEC3；使用 Apple 系统原生 AEC 需要实验性开关 --enable-blink-features=ExperimentalHardwareEchoCancellation（M66/M67 引入，M68 起行为变化但 flag 不变），另有 echoCancellationType: 'system' 约束（M68 实验性）与更新的 echoCancellationMode 提案。均非稳定 API。",
+        "confidence": "medium",
+        "source_url": "https://developer.chrome.com/blog/macos-native-echo-cancellation"
+      },
+      {
+        "fact": "Electron 已确认 issue #47043：getUserMedia({audio:{echoCancellation:true}}) 在 Electron 中无效而同代码在 Chrome 中正常。复现环境为 Electron 37 / Windows 11 ARM64，标签 status/confirmed，最终 closed as not planned。macOS 是否受影响未在该 issue 中确认，必须自测。",
+        "confidence": "high",
+        "source_url": "https://github.com/electron/electron/issues/47043"
+      },
+      {
+        "fact": "livekit-wakeword：pip install livekit-wakeword[train,eval,export]，一条命令（livekit-wakeword run configs/xxx.yaml）合成数据+增强+训练+导出 ONNX，有 Python 与 Rust 推理。官方对比：0.08 误唤醒/小时（FPPH）vs openWakeWord 8.50 FPPH（100 倍改善），召回率 86% vs 69%。",
+        "confidence": "medium",
+        "source_url": "https://livekit.com/blog/livekit-wakeword"
+      },
+      {
+        "fact": "Picovoice Porcupine：macOS x86_64/arm64 支持，官方称 97%+ 准确率、背景语音与噪声下每 10 小时少于 1 次误报；免费档限每月 3 个活跃用户（可商用），商业方案起价 $6000。",
+        "confidence": "medium",
+        "source_url": "https://picovoice.ai/docs/quick-start/porcupine-macos/"
+      },
+      {
+        "fact": "macOS 26 起可用 Apple Speech 框架的 SpeechAnalyzer（模块化、AsyncSequence、并发友好）与 SpeechTranscriber（流式设备端转写）、SpeechDetector（检测音频流中是否有语音），定位为 SFSpeechRecognizer 的继任者，语言资产通过系统 asset catalog 下载。完全离线、免费。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/videos/play/wwdc2025/277/"
+      },
+      {
+        "fact": "FluidAudio（Swift Package，FluidInference/FluidAudio）：CoreML 后端、Apple Silicon 优化、跑 ANE，提供 Parakeet TDT v3 0.6b ASR（25 种欧洲语言）、Silero VAD、Pyannote 说话人分离、TTS。要求 macOS 14.0+ / iOS 17.0+。最新版本 v0.15.5（约 2026-08-11 更新）。",
+        "confidence": "medium",
+        "source_url": "https://github.com/FluidInference/FluidAudio"
+      },
+      {
+        "fact": "Node/Bun 侧本地语音：sherpa-onnx 提供官方 Node.js addon（npm install sherpa-onnx，node-addon-api/N-API），涵盖流式 ASR（Zipformer/Paraformer）、TTS、VAD（Silero）、关键词唤醒（KWS，如 sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01），离线可用。麦克风采集可用 naudiodon（PortAudio 的 Node stream 绑定，含 macOS loopback）。",
+        "confidence": "medium",
+        "source_url": "https://github.com/k2-fsa/sherpa-onnx/blob/master/nodejs-addon-examples/README.md"
+      },
+      {
+        "fact": "Pipecat 的 TTS 文本聚合有两种模式：SENTENCE（默认，按句末标点 .!? + 空白切分，排除缩写/小数误判，最小句长 10 字符，约增加 200–300ms/句延迟）与 TOKEN（逐 token 直送，延迟更低但音质取决于 TTS 供应商）。打断由 PipelineTask(allow_interruptions=True) 控制：取消 TTS 流、清空音频缓冲；WebSocket 类 TTS 无词级时间戳时通过重连 WebSocket 实现打断。",
+        "confidence": "high",
+        "source_url": "https://reference-server.pipecat.ai/en/stable/api/pipecat.services.tts_service.html"
+      },
+      {
+        "fact": "框架生态（2026-07 数据）：Pipecat 13,416 stars、LiveKit Agents 11,356、TEN Framework 10,898。Vocode 核心被评为停滞（maintenance risk）。TEN Framework 主仓最后更新 2026-08-06，由 Agora 支撑商业部署，含 TEN VAD / TEN Turn Detection / TMAN Designer。",
+        "confidence": "medium",
+        "source_url": "https://techsy.io/en/blog/best-open-source-voice-agent-frameworks"
+      },
+      {
+        "fact": "生产环境端点检测默认值差异巨大：Vapi ~1450ms、Retell ~700ms、Pipecat ~300ms。2026 年的主导延迟因素是轮次检测逻辑而非模型推理。业界 stitched stack 中位端到端 680ms p50 / 1180ms p95。",
+        "confidence": "medium",
+        "source_url": "https://telnyx.com/resources/voice-ai-agents-compared-latency"
+      },
+      {
+        "fact": "macOS 麦克风权限：Info.plist 根层级需要 NSMicrophoneUsageDescription。TCC 弹窗对子进程生效的前提是父 App bundle 有有效代码签名 + Info.plist 有 usage description key；签名一旦失效，TCC 会静默拒绝所有子进程权限请求（不弹窗、不报错）。Electron 通过 electron-builder 的 extendInfo 注入；Tauri 有已知的 Rust 侧麦克风权限 issue（#9928、#11951），可用 tauri-plugin-macos-permissions 检查/请求。",
+        "confidence": "high",
+        "source_url": "https://developer.apple.com/documentation/bundleresources/information-property-list/nsmicrophoneusagedescription"
+      }
+    ],
+    "gotchas": [
+      "【AEC 头号坑】VoiceProcessingIO 在输入/输出设备不一致时直接失败（err -10875，AggregateDevice 声道数断言失败）。AirPods 麦 + 内置扬声器就会炸，而「桌面女友」场景用户随时插拔耳机。必须监听 kAudioHardwarePropertyDefaultInputDevice/OutputDevice 变化并重建 engine；设备不匹配时降级为 PTT 或强制单设备。Apple 论坛该 bug 帖至今 0 回复。",
+      "【AEC 第二坑】VoiceProcessingIO 会把整机音频通路切成「通话模式」：其他 App 的音乐会被 duck、采样率被强制、可能出现 AGC 抽气声和底噪。对 24h 常驻的角色来说这是灾难性副作用——用户不说话时必须把 voice processing 关掉（或整个 engine stop），只在会话期间开启。",
+      "【AEC 第三坑】AEC 的参考信号必须是「实际送到扬声器的那一路」。如果你在 Swift 里用 AVAudioPlayer/AVAudioPlayerNode 在另一个 engine 上播 TTS，而 AEC 挂在采集 engine 上，AEC 拿不到参考信号 → 完全无效。TTS PCM 必须从同一个开启了 voice processing 的 engine 的 output/mainMixer 走。",
+      "外放 + 大音量 → 扬声器非线性失真，线性自适应滤波器建模不了，回声一定会漏。漏出来的残留会被 VAD 判成用户说话 → AI 自己打断自己，进入死循环。必须加三重门槛：AI 说话期间提高 VAD 阈值、要求连续 N 帧（如 300ms）语音、且 ASR 吐出真实词（非空白 token）才算 barge-in。开发期先用耳机验证逻辑，再单独攻外放。",
+      "别假设「塞进 WebView 就自动有 AEC」。Tauri 在 macOS 上用的是 WKWebView 不是 Chromium，没有 AEC3；WebKit 有历史 bug 179411（getUserMedia echoCancellation 约束无效）。Electron 有已确认的 echoCancellation 失效 issue #47043（Windows ARM64 复现，closed as not planned），macOS 上必须写个 10 行 demo 亲自实测录音里有没有 AI 的声音。",
+      "Pipecat 自身不提供 AEC。官方 macOS 本地样例的 AEC 完全来自浏览器 WebRTC 栈（SmallWebRTCTransport + React 客户端）。如果你图省事改成 LocalAudioTransport（PyAudio 直连系统音频），AEC 就没了，issue #670 问过这事、无解决方案。",
+      "Silero VAD 在「语音→静音」转换上有几百毫秒延迟（TEN VAD 官方 PR 曲线对比），直接拿它做端点判定等于白送 200–300ms，而且它识别不出相邻语音段之间的短静音。要么换 TEN VAD，要么在 Silero 的静音信号上叠 smart-turn v3 做语义端点。",
+      "分句喂 TTS 的中文陷阱：中文句末标点是全角（。！？；……），英文正则 [.!?]\\s 完全匹配不到，会一路憋到 LLM 流结束才 flush，首音延迟直接崩掉。另外 Pipecat 默认的「最小句长 10 字符」规则对中文太长——中文 10 个字已经是一整句了，会导致该切的地方不切。这两处必须自己覆写 text aggregator。",
+      "唤醒词常驻的真实代价不是功耗而是误唤醒。openWakeWord 实测 8.5 次误唤醒/小时，一个挂桌面的虚拟角色会随机自言自语，体验灾难。v1 请用「按住热键 / 点角色」，把唤醒词留到 v2 且用 livekit-wakeword（0.08 FPPH）或 Porcupine。",
+      "Porcupine 免费档只有「每月 3 个活跃用户」，个人自用够，一旦想分发就撞墙，商业方案起价 $6000。开源自训练路线（livekit-wakeword / openWakeWord）没有这个限制。",
+      "TCC 权限的静默失败：如果你 spawn 一个 Python/Node 子进程去读麦克风，子进程继承父 App 的 TCC 授权，前提是父 App bundle 有有效签名。签名一旦被改动失效，TCC 不弹窗、不报错，直接给你一路静音的音频流——极难 debug。开发期从 Terminal 启动的进程挂在 Terminal 的权限下，会掩盖这个问题。",
+      "DashScope 免费额度是「每个模型 100 万 token / 90 天 / 仅新加坡站」。实时音频 token 烧得极快（omni-realtime 音频输入 $4.57/百万 token、输出 $17.7–18.13/百万 token），别拿免费额度去推算长期陪伴场景的成本——那是数量级差异。级联方案（qwen3.5-flash $0.1/$0.4 + ASR 按秒 + TTS 按字符）便宜一到两个数量级。",
+      "Qwen omni-realtime 的 semantic_vad 只在服务端生效，救不了你本地的回声：AI 自己的声音会被你推上去，服务端会判成用户在说话并触发打断。走 realtime 方案同样必须先解决本机 AEC。",
+      "本地全栈（MLX LLM + ASR + TTS）会和 2560x1440 60fps 的角色渲染抢统一内存带宽和 GPU，风扇一转起来，「安静陪伴」的人设就崩了。建议：渲染优先本地，语音链路默认走云端，本地模型只做离线兜底。",
+      "macOS 26 的 SpeechAnalyzer/SpeechTranscriber 是免费且完全离线的最优 ASR 选择，但它是 Swift-only、macOS 26+ 独占，且语言资产要走系统 asset catalog 首次下载。如果你的架构是 Python/Node 主导，用不上它——这会反过来影响你的语言/进程选型，值得先决策。",
+      "Vocode 已被评为停滞（maintenance risk），不要作为新项目基座。"
+    ]
+  },
+  "app-shell": {
+    "topic": "akari App 外壳技术选型：Swift 原生 vs Tauri 2 vs Electron（macOS 26.6 桌面驻留 AI 虚拟人）",
+    "summary": "结论先行：**推荐「Swift/AppKit 外壳 + WKWebView 渲染形象」的混合方案**，而不是 Tauri 或 Electron。\n\n理由建立在我在本机（macOS 26.6.1 / Apple Silicon / Swift 6.3.3）实测出的一条硬约束上，而不是文档：**桌面壁纸层只有一个正确的窗口 level，三家框架里只有 Swift 能干净地设到它。**\n\n实测 macOS 26.6.1 的真实桌面窗口栈：Dock 画的真壁纸在 layer **-2147483624**，Finder 桌面图标在 **-2147483603**。要\"贴在壁纸上、图标下\"，唯一正确的值是 `CGWindowLevelForKey(.desktopWindow)` = **-2147483623**。我写了个 borderless NSWindow 设成这个值，实测它精确落在 Dock 壁纸窗口之上、Finder 图标窗口之下——正是目标位置。\n\n而 **Electron 的 `type:'desktop'` 是错的**：我读了 Electron v43.4.1 源码 `shell/browser/native_window_mac.mm:276`，它设的是 `kCGDesktopWindowLevel - 1` = -2147483624，**和 Dock 真壁纸同层**（同层 z-order 未定义，行为不稳定），并且同时 `setDisableKeyOrMainWindow:YES`，永久不可聚焦、公开 API 无法撤销。**Tauri 则根本没有 set_level API**（issue #4620 至今 open），必须自己 `ns_window()` + objc2 写 Objective-C 调用；而且 Tauri 透明窗口要开 `macOSPrivateApi`（官方定义：启用私有透明背景 API），直接断送 Mac App Store。\n\n第二条硬约束（对三家一视同仁，是 OS 行为）：**桌面层窗口收不到鼠标键盘**。实测 `canBecomeKey=true` 但 `makeKeyAndOrderFront` + `NSApp.activate` 后 `isKeyWindow` 仍为 false——Finder 的全屏桌面图标窗口在你之上吃掉了点击。任何方案都必须做\"按需临时提升 level\"（Plash 的 Browsing Mode 即此）。\n\n第三条：渲染代价实测。纯 AppKit 外壳 = **80 KB 二进制 / 6.9 MB 内存**；加一个 2560x1440 透明 WKWebView 跑 WebGL2 = 主进程 20.3 MB footprint + WebKit 辅助进程 **+78 MB RSS**，合计约 100–150 MB。这印证了社区报告的\"Tahoe 上 WebView 内存约 110 MB、是 Sequoia 的 4 倍\"。\n\n好消息：形象渲染的两条路在本机都实测可用——**HEVC-with-Alpha 硬件解码 = YES**（还支持硬件编码，可自己压带 alpha 的素材），以及**透明 WKWebView 仍然可用**（`setValue(false, forKey:\"drawsBackground\")` 在 26.6.1 上有效），内含 WebGL2 / Apple GPU / dPR=2，Live2D Cubism Web SDK 与 three.js 可直接跑。\n\n对 TS/Rust 主力、Swift 不熟的开发者：混合方案把 Swift 的用量压到约 300–500 行（窗口 level、菜单栏、TCC 权限、AX 调用、音频），形象、对话 UI、Qwen 接入全部留在 TypeScript。这是唯一既拿到正确窗口层、又不放弃主力语言的路径。",
+    "options": [
+      {
+        "name": "混合方案：Swift/AppKit 外壳 + WKWebView 渲染形象（推荐）",
+        "how": "Swift 侧约 300–500 行，只做四件事：(1) 窗口 —— borderless NSWindow，`level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))` = -2147483623，`collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]`，`isOpaque=false`、`backgroundColor=.clear`、`hasShadow=false`；(2) 菜单栏常驻 —— `NSApp.setActivationPolicy(.accessory)` + NSStatusItem，无 Dock 图标；(3) 系统能力 —— AXUIElement 控制电脑、AVAudioEngine/AVCaptureDevice 采音、AVSpeechSynthesizer 或外部 TTS 朗读；(4) 交互 —— 需要互动时把 level 临时提到 .normal，失焦再降回桌面层。形象层用 WKWebView 加载本地 Live2D Cubism 5 Web SDK 或 three.js，`setValue(false, forKey:\"drawsBackground\")` 开透明（本机 26.6.1 实测有效，WebGL2/Apple GPU/MAX_TEXTURE_SIZE=16384 可用）。Swift ↔ JS 用 `WKScriptMessageHandler` + `evaluateJavaScript` 双向通信。若走写实风预渲染视频路线，则改用 AVPlayerLayer 播 HEVC-with-Alpha（本机硬解实测 YES），注意必须用 AVPlayerLayer，AVPlayerView 不支持 alpha（黑底，FB9042670）。",
+        "pros": "唯一能干净拿到 -2147483623 精确层级的方案，无私有 API、可上 Mac App Store；系统能力（AX / 音频 / TTS / 快捷键 / TCC）全是第一方直调，无桥接损耗；换装、对话 UI、Qwen 接入全留在 TypeScript，主力语言不丢；Swift 代码量小到可控，且都是抄得到的模板代码；渲染方案可后期无痛切换（WKWebView → Metal/AVFoundation）而不动外壳。",
+        "cons": "需要写一点 Swift 和 AppKit，有学习成本（但集中在窗口/权限两块，约一周内可跨过）；WKWebView 内存约 100–150 MB（实测主进程 20.3 MB footprint + WebKit 辅助进程 78 MB RSS）；Swift↔JS 桥接是异步 JSON，高频状态同步需自己设计节流；分发需 Apple Developer 账号做签名+公证。",
+        "maturity": "production-ready",
+        "cost": "Apple Developer Program 99 USD/年（公证必需）。工程量：窗口+菜单栏外壳 3–5 天，权限与 AX 3–5 天，Web 渲染层按形象方案另计。"
+      },
+      {
+        "name": "Tauri 2.11.5（Rust + WKWebView）",
+        "how": "`tauri.conf.json` 里 `app.macOSPrivateApi: true` 开透明背景，窗口设 `transparent: true`、`decorations: false`。桌面层**必须自己写**：`window.ns_window()` 拿到指针，用 `objc2-app-kit` cast 成 `&NSWindow` 后调 `setLevel:`，因为 Tauri 至今没有 set_level API（issue #4620 仍 open，标 status: upstream）。`set_always_on_bottom` 有，但那只是「在普通窗口之下」，不是桌面层，达不到效果。点击穿透用 `set_ignore_cursor_events`，但 Tauri 无逐区域命中测试，社区实践是 Rust 侧 60fps 轮询鼠标坐标来回切换。AX 控制用 `axuielement` crate（v0.9）或 `objc2-accessibility`。",
+        "pros": "Rust 是开发者主力语言之一；前端完全是 Web，Live2D/three.js 直接嵌；包体积小（约 10–20 MB，远小于 Electron）；插件生态活跃（tauri-plugin-decorum 提供 set_window_level）；跨平台，若日后要出 Windows 版可复用。",
+        "cons": "致命项：透明窗口依赖 `macOSPrivateApi`（官方定义为「启用私有透明背景 API」）→ 永久无法上 Mac App Store；桌面层要自己写 objc2 unsafe 代码——既然都要写 Objective-C 调用，用 Swift 直接写反而更短更安全；社区报告 macOS 26 Tahoe 上 WebView 内存 110 MB，是 Sequoia（20–29 MB）的 4 倍；已知 bug：打包成 DMG 后透明度丢失（issue #13415）；无逐区域命中测试，60fps 轮询鼠标是明显的功耗与手感妥协。",
+        "maturity": "usable",
+        "cost": "免费。工程量与混合方案相近，但要额外趟 objc2 unsafe 与 macOSPrivateApi 的坑，且丧失 MAS 分发。"
+      },
+      {
+        "name": "Electron 43.4.1（Chromium + Node）",
+        "how": "`new BrowserWindow({ type: 'desktop', transparent: true, frame: false })`。`setAlwaysOnTop(flag, level)` 支持 normal/floating/torn-off-menu/modal-panel/main-menu/status/pop-up-menu/screen-saver（dock 已废弃），但**没有 desktop 这个 level**——桌面层只能靠构造时的 `type: 'desktop'`。`setVisibleOnAllWorkspaces(true, {visibleOnFullScreen: true})` 可跨空间常驻。音频走标准 Web getUserMedia + Web Audio，是三者中最省事的。AX 控制需自写 native module 或 shell 出去调。",
+        "pros": "生态最成熟、文档最全、招人/查资料最容易；Web 技术栈 100% 复用，TypeScript 主力语言零摩擦；音频采集播放用标准 Web API，最省心；Chromium 渲染一致性好，WebGL/WebGPU 性能可预期，不受 Safari/WebKit 差异困扰；调试工具最好。",
+        "cons": "桌面层实现是错的：源码实测 `setLevel:kCGDesktopWindowLevel - 1` 与 Dock 真壁纸同层，z-order 未定义；同时 `setDisableKeyOrMainWindow:YES` 让窗口永久不可聚焦，且公开 API 无法撤销——意味着「换装面板」「文字输入对话」这类交互在同一窗口内做不了，必须再开一个普通窗口；体积代价最大（安装包 150–200 MB，空应用常驻 150–200 MB，实际产品 300–500 MB）；对一个 7x24 常驻的桌面伴侣来说功耗与内存都不友好；macOS 专属的 desktop 壁纸方案无现成库（electron-as-wallpaper 明确仅支持 Windows）。",
+        "maturity": "usable",
+        "cost": "免费。开发最快，但桌面层这一核心需求要靠自写 native module 绕过，反而可能比 Swift 更慢。"
+      },
+      {
+        "name": "纯 Swift 原生（Metal / AVFoundation 直渲，不用 WebView）",
+        "how": "窗口与系统能力同混合方案。形象层不用 Web：写实风预渲染视频走 AVPlayerLayer + HEVC-with-Alpha（本机硬解 YES，且硬件编码器可用，能自己压素材）；或 AVPlayerItemVideoOutput 取帧交给 Metal 做自定义合成/换装/滤镜；2D 骨骼动画可用 SpriteKit，3D 用 SceneKit/RealityKit 或自写 Metal 管线。",
+        "pros": "内存与功耗最优（实测纯 AppKit 外壳 6.9 MB / 二进制 80 KB，比 WebView 路线省一个数量级）；对 2560x1440@60fps 这种高负载场景，Metal 直渲是唯一能稳定跑满且不烧电的方案；无任何私有 API，MAS 可上；启动瞬时。",
+        "cons": "开发者 Swift 不熟，Metal/SpriteKit 学习曲线陡，这是全部四个方案里对现有技能复用率最低的；换装、UI 布局、对话气泡这些用 AppKit/SwiftUI 写远比 HTML/CSS 慢；Live2D 要改用 Cubism Native SDK（C++），集成成本高于 Web SDK；迭代速度慢，不适合前期方案还在变的阶段。",
+        "maturity": "production-ready",
+        "cost": "Apple Developer 99 USD/年。工程量最大，前期迭代速度约为混合方案的 1/2～1/3。"
+      }
+    ],
+    "hard_facts": [
+      {
+        "fact": "本机实测（macOS 26.6.1 / Apple Silicon）CGWindowLevelForKey 取值：desktopWindow = -2147483623，desktopIconWindow = -2147483603，normal = 0，floating = 3，dock = 20，mainMenu = 24，statusBar = 25，popUpMenu = 101，screenSaver = 1000，maximum = 2147483631，minimum = -2147483643。注意 screenSaver 在 macOS 26 上是 1000，广为引用的 2020 年博客里写的 101 已过时。",
+        "confidence": "high",
+        "source_url": "本机 swift 脚本实测 CGWindowLevelForKey；对照 https://jameshfisher.com/2020/08/03/what-is-the-order-of-nswindow-levels/"
+      },
+      {
+        "fact": "本机实测 macOS 26.6.1 真实桌面窗口栈：layer -2147483626 = WindowServer Display Backstop；-2147483625 = 「墙纸」Offscreen Wallpaper Window；-2147483624 = Dock(程序坞) 的 Wallpaper-<UUID>（真正的壁纸）；-2147483623 = desktopWindow 层（Bartender 的 DesktopWallpaperHelperWindow 就在此）；-2147483603 = Finder(访达) 桌面图标；-2147483601 = 通知中心小组件；0 = 普通应用窗口。",
+        "confidence": "high",
+        "source_url": "本机 CGWindowListCopyWindowInfo([.optionOnScreenOnly]) 实测"
+      },
+      {
+        "fact": "akari 要「贴壁纸之上、桌面图标之下」，正确窗口层是 CGWindowLevelForKey(.desktopWindow) = -2147483623。实测：borderless NSWindow 设成该值后，z-order 上直接位于 Dock 壁纸窗口之上、Finder 图标窗口之下（实测输出：directly BELOW us = Bartender layer=-2147483623，directly ABOVE us = 访达 layer=-2147483603）。",
+        "confidence": "high",
+        "source_url": "本机 Swift 实测（NSWindow + CGWindowListCopyWindowInfo z-order 验证）"
+      },
+      {
+        "fact": "Electron v43.4.1 源码 shell/browser/native_window_mac.mm 第 276–281 行：`if (windowType == \"desktop\") { [window_ setLevel:kCGDesktopWindowLevel - 1]; [window_ setDisableKeyOrMainWindow:YES]; [window_ setCollectionBehavior:(CanJoinAllSpaces|Stationary|IgnoresCycle)]; }`。即 level = -2147483624，与 Dock 真壁纸窗口同层，且永久禁用 key/main 窗口。",
+        "confidence": "high",
+        "source_url": "https://github.com/electron/electron/blob/v43.4.1/shell/browser/native_window_mac.mm"
+      },
+      {
+        "fact": "Electron setAlwaysOnTop 的 level 合法值只有：normal / floating / torn-off-menu / modal-panel / main-menu / status / pop-up-menu / screen-saver / dock(已废弃)。**没有 desktop**。桌面层只能通过构造函数的 `type: 'desktop'` 获得，且不可后期切换。",
+        "confidence": "high",
+        "source_url": "https://www.electronjs.org/docs/latest/api/base-window"
+      },
+      {
+        "fact": "Electron 最新稳定版为 v43.4.1（2026-08-19 发布），同期维护中的还有 v42.9.3、v41.10.6。",
+        "confidence": "high",
+        "source_url": "https://github.com/electron/electron/releases（gh api 实时查询）"
+      },
+      {
+        "fact": "Tauri 最新稳定版为 tauri v2.11.5（2026-07-01 发布）。",
+        "confidence": "high",
+        "source_url": "https://github.com/tauri-apps/tauri/releases（gh api 实时查询）；https://tauri.app/release/core/"
+      },
+      {
+        "fact": "Tauri 至今没有 set_level / set_window_level API。功能请求 issue #4620（2022-07-07 创建）仍为 open，标签 status: upstream（被上游阻塞）。WebviewWindow 只提供 set_always_on_top / set_always_on_bottom / set_visible_on_all_workspaces / set_ignore_cursor_events / set_shadow / set_background_color。要设桌面层必须 `window.ns_window()` + objc2-app-kit 自行调 setLevel:。",
+        "confidence": "high",
+        "source_url": "https://github.com/tauri-apps/tauri/issues/4620 ; https://docs.rs/tauri/latest/tauri/webview/struct.WebviewWindow.html"
+      },
+      {
+        "fact": "Tauri 官方 config 对 macOSPrivateApi 的定义原文：「MacOS private API configuration. Enables the transparent background API and sets the fullScreenEnabled preference to true.」即 macOS 透明窗口依赖私有 API，开启后无法上架 Mac App Store。",
+        "confidence": "high",
+        "source_url": "https://v2.tauri.app/reference/config/"
+      },
+      {
+        "fact": "Tauri 有 set_always_on_bottom / alwaysOnBottom（Rust Window::set_always_on_bottom、JS setAlwaysOnBottom、config always_on_bottom），由 issue #7847 / PR #7933 引入。但它只是「始终位于其他窗口之下」，属于普通窗口层，**不是桌面壁纸层**，无法达到贴桌面背景的效果。",
+        "confidence": "high",
+        "source_url": "https://github.com/tauri-apps/tauri/issues/7847 ; https://github.com/tauri-apps/tauri/commit/c1ec0f155118527361dd5645d920becbc8afd569"
+      },
+      {
+        "fact": "Tauri v2 访问原生 NSWindow 的写法：`use objc2_app_kit::{NSColor, NSWindow}; let ptr = window.ns_window().unwrap() as *mut NSWindow; let ns_window = unsafe { &*ptr };` 需在 Cargo.toml 加 objc2-app-kit（0.3.2+）依赖并开启对应 feature。",
+        "confidence": "high",
+        "source_url": "https://v2.tauri.app/learn/window-customization/"
+      },
+      {
+        "fact": "本机实测 VideoToolbox 硬件解码支持：H.264 = YES，HEVC = YES，**HEVC-with-Alpha (kCMVideoCodecType_HEVCWithAlpha) = YES**，ProRes4444 = YES，AV1 = YES。硬件编码器可用性：HEVC = true，**HEVC-with-Alpha = true**（可自行压制带 alpha 的素材）。",
+        "confidence": "high",
+        "source_url": "本机 Swift 实测 VTIsHardwareDecodeSupported / VTCopySupportedPropertyDictionaryForEncoder"
+      },
+      {
+        "fact": "AVPlayer 与 AVPlayerLayer 支持 HEVC-with-Alpha 并可与 Core Animation 图层合成透明播放；但 **AVPlayerView 不支持 alpha**，播放带 alpha 的视频会得到黑底（已提 FB9042670）。需自定义渲染时用 AVPlayerItemVideoOutput 取帧交给 Metal/SpriteKit。",
+        "confidence": "high",
+        "source_url": "https://github.com/feedback-assistant/reports/issues/197 ; https://asciiwwdc.com/2019/sessions/506"
+      },
+      {
+        "fact": "本机实测 macOS 26.6.1 上透明 WKWebView 仍可用：`wv.setValue(false, forKey: \"drawsBackground\")` 生效（读回 0）。注意这是 KVC-only 私有属性，`responds(to: setDrawsBackground:)` 返回 false。桌面层 WKWebView 内 WebGL2 可用，renderer = \"Apple GPU\"，MAX_TEXTURE_SIZE = 16384，devicePixelRatio = 2。",
+        "confidence": "high",
+        "source_url": "本机 Swift + WebKit 实测"
+      },
+      {
+        "fact": "本机实测内存与体积：编译后的 Swift AppKit 二进制 = 80,392 字节（80 KB）；纯 AppKit 外壳 phys_footprint = 6.9 MB；加载 2560x1440 透明 WKWebView 并跑 WebGL2 后主进程 phys_footprint = 20.3 MB（RSS 68 MB），另外 com.apple.WebKit 辅助进程增量 = +78.0 MB RSS（247.4 → 325.4 MB）。即 WebView 路线合计约 100–150 MB。",
+        "confidence": "high",
+        "source_url": "本机 task_vm_info phys_footprint + ps RSS 前后差值实测"
+      },
+      {
+        "fact": "社区实测 Tauri v2 桌面悬浮层在不同 macOS 版本的内存：Sequoia 20–29 MB，Sonoma 66 MB，Tahoe(macOS 26) 110 MB —— 作者归因为「OS 层面的 webview 回归」。该数量级与我本机测得的 WebKit 路线约 100–150 MB 相互印证。",
+        "confidence": "medium",
+        "source_url": "https://blog.manasight.gg/why-i-chose-tauri-v2-for-a-desktop-overlay/"
+      },
+      {
+        "fact": "Electron 体积基线（2026 年数据）：Chromium+Node+V8+ffmpeg 每平台约 120 MB；正常生产安装包 150–200 MB；空应用常驻 150–200 MB，带 React UI 的生产应用 300–500 MB。",
+        "confidence": "medium",
+        "source_url": "https://www.forasoft.com/blog/article/electron-desktop-app-development-guide-for-business"
+      },
+      {
+        "fact": "本机 Swift 版本为 6.3.3（swiftlang-6.3.3.1.3，target arm64-apple-macosx26.0），系统 macOS 26.6.1（Build 25G76）。Swift 6.3 随 Xcode 26.4（build 17E192，2026-03-24 发布）出货。",
+        "confidence": "high",
+        "source_url": "本机 swift --version / sw_vers；https://www.swift.org/blog/whats-new-in-swift-march-2026/"
+      },
+      {
+        "fact": "Swift 6.2 引入的 Approachable Concurrency 与 Default Actor Isolation 在 6.3 中延续：开启后代码默认跑在 @MainActor 上，SE-0461 让 nonisolated async 函数在调用方 actor 上执行、不再强制 actor hop。对 akari 这类「UI/窗口全在主线程、只有推理和音频在后台」的应用非常友好，可显著降低 Swift 6 严格并发的上手成本。",
+        "confidence": "medium",
+        "source_url": "https://www.avanderlee.com/concurrency/default-actor-isolation-in-swift-6-2/"
+      },
+      {
+        "fact": "Live2D Cubism 5 SDK for Web，R5 正式版于 2026-04-02 发布。个人与小规模企业免于 Publication License 协议与付费；但「Expandable Application」（指具备显著扩展性的服务/内容，如 VTuber 追踪软件）需单独审批并签订发布许可协议。具体营收门槛与费率官方未公开，需直接联系 Live2D。",
+        "confidence": "medium",
+        "source_url": "https://www.live2d.com/en/sdk/license/ ; https://github.com/Live2D/CubismWebSamples"
+      },
+      {
+        "fact": "Rust 侧调用 macOS Accessibility API 可用 axuielement crate（v0.9，提供 AXUIElement/AXObserver/AXValue/AXTextMarker/ProcessTrust 等十个模块及异步 AXObserver 通知）或 objc2-accessibility（objc2 项目的一部分）。",
+        "confidence": "medium",
+        "source_url": "https://github.com/doom-fish/axuielement-rs ; https://lib.rs/crates/objc2-accessibility"
+      },
+      {
+        "fact": "electron-as-wallpaper 库**仅支持 Windows**（Win 7/8/10/11），明确不支持 macOS。macOS 上没有现成的 Electron 桌面壁纸层方案。",
+        "confidence": "high",
+        "source_url": "https://github.com/meslzy/electron-as-wallpaper"
+      },
+      {
+        "fact": "Plash（最知名的 macOS 网页壁纸应用，参考实现）**已不再开源**，仓库仅剩 readme。无法再参考其 DesktopWindow.swift 源码。",
+        "confidence": "high",
+        "source_url": "https://github.com/sindresorhus/Plash（gh api 实测仓库树仅含 .editorconfig/.gitattributes/Stuff/readme.md）"
+      },
+      {
+        "fact": "本机实测系统框架均存在于 macOS 26.6.1：Speech.framework（语音识别）、ScreenCaptureKit.framework（屏幕/系统音频采集）、FoundationModels.framework（Apple 端侧 LLM）。AVSpeechSynthesisVoice 共 180 个声音，其中中文 18 个（zh-CN 含 Tingting + 8 个 eloquence 系列，zh-TW 含 Meijia 等），但均为 quality=1（低质），做「朗读文本」需外接 TTS。",
+        "confidence": "high",
+        "source_url": "本机 Swift 实测 AVSpeechSynthesisVoice.speechVoices() 与 FileManager 框架路径探测"
+      },
+      {
+        "fact": "本机实测音频采集：AVCaptureDevice.DiscoverySession(deviceTypes:[.microphone,.external], mediaType:.audio) 可枚举到全部输入设备（MacBook Pro 麦克风、蓝牙耳机、iPhone 连续互通麦克风、各类虚拟声卡）。authorizationStatus(for:.audio) 初始为 0 (notDetermined)，需在 Info.plist 声明 NSMicrophoneUsageDescription 并触发授权。",
+        "confidence": "high",
+        "source_url": "本机 Swift 实测 AVCaptureDevice"
+      }
+    ],
+    "gotchas": [
+      "【最大的坑，决定选型】桌面层窗口收不到鼠标和键盘。本机实测：窗口设到 -2147483623 后 `canBecomeKey` 返回 true，但执行 `makeKeyAndOrderFront(nil)` + `NSApp.activate(ignoringOtherApps:true)` 之后 `isKeyWindow` 仍然是 **false**。原因是 Finder 的全屏桌面图标窗口在 -2147483603 层、盖在你之上，先吃掉了点击。这是 WindowServer 行为，Swift/Tauri/Electron 一视同仁，没有框架能绕过。唯一解法是「按需提升层级」：要交互时把 level 临时调到 .normal（或 .floating），失焦后再降回桌面层——Plash 的 Browsing Mode 就是这个套路。**这意味着「桌面驻留」和「可交互」在同一时刻只能二选一，必须在产品设计阶段就想清楚交互入口（菜单栏点击、全局快捷键、语音唤醒）。**",
+      "【Electron 的 type:'desktop' 在 macOS 上不可用于本项目】两个独立的致命问题：(1) 它设的 level 是 -2147483624，与 Dock 绘制真壁纸的窗口**完全同层**，同层之间 z-order 由 WindowServer 决定、无保证，可能被壁纸盖住；(2) 它同时无条件执行 `setDisableKeyOrMainWindow:YES`，且这是构造时写死的、公开 API 无法撤销——连上面说的「临时提升层级换取交互」这条退路都被堵死。想做换装面板或文字输入，必须另开一个普通 BrowserWindow。",
+      "【Tauri 的透明窗口 = 放弃 Mac App Store】`macOSPrivateApi` 官方定义就是「启用私有透明背景 API」。一个透明无边框的虚拟人窗口必然要开它，等于 MAS 分发从第一天就出局，只能走 Developer ID 直接分发。如果 akari 未来有上架打算，这是不可逆的架构决定。",
+      "【Tauri 打包后透明度丢失】已知 bug：`.transparent(true)` 在 dev 下正常，构建成 DMG 后透明失效（issue #13415）。这类「开发环境正常、打包后崩」的坑最耗时间，选型前应先做一个打包验证的最小 spike，别等功能写完才发现。",
+      "【AXIsProcessTrusted() 会撒谎】本机实测：`AXIsProcessTrusted()` 返回 **true**，但紧接着的 `AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute)` 返回 **-25204 (kAXErrorAPIDisabled)**。原因是 TCC 授权绑定在**已签名的 bundle** 上，未签名的脚本/裸二进制会继承父进程的「已授权」回答却在真实调用时被拒。开发期一定要**用签名过的 .app bundle 测试 Accessibility**，直接跑 swift 脚本或 `cargo run` 得到的结论不可信。同理，每次重新签名（换证书、改 bundle id）都会让用户的授权失效、需要重新授权。",
+      "【Swift 脚本模式的内存数字不可信】`swift foo.swift` 解释执行时进程占用 93.1 MB（含编译器本身）；同一份代码 `swiftc -O` 编译后只有 6.9 MB。做任何性能/内存对比一定要用编译产物，否则会得出「Swift 比 Electron 还占内存」的荒谬结论。",
+      "【2560x1440 + Retina = 实际 5120x2880 的渲染负担】本机 WKWebView 内 devicePixelRatio = 2。若照搬 Windows 上 2560x1440 的素材规格，在 Mac 上后备存储是它的 4 倍像素。60fps 满屏合成对 GPU 和电池都是持续压力，笔记本上尤其明显。建议：微动作（呼吸/眨眼/转头）只重绘变化区域，或直接用 HEVC-with-Alpha 预渲染视频循环（硬解，功耗远低于实时 WebGL），静止时降到 30fps 甚至暂停。",
+      "【macOS Sonoma 起「点击壁纸显示桌面」会干扰体验】系统设置 → 桌面与程序坞 → 「点击墙纸以显示桌面」默认开启。用户点到 akari 所在的桌面区域时可能触发隐藏全部窗口。需要在 onboarding 里引导用户关掉，或接受这个交互冲突。",
+      "【macOS 26.x 有 borderless 窗口交互回归的报告】开发者论坛有「macOS 26.3 RC 后所有 borderless 窗口交互失效，点击事件不投递、窗口无法移动」的报告；另有 macOS 26 起 NSToolbarView 内新增 NSGlassContainerView 截获鼠标事件的问题。我在 26.6.1 上未复现（窗口创建与层级都正常），但没有做真实点击测试。**这条置信度 low**，建议在目标 macOS 版本上做一次真实点击验证。",
+      "【HEVC alpha 必须用 AVPlayerLayer，不能用 AVPlayerView】AVPlayerView 从未支持 alpha 通道，播带透明的视频会得到黑底（FB9042670，多年未修）。这是个很容易踩的坑——SwiftUI 的 VideoPlayer 底层也是 AVPlayerView 系，同样不行。必须自己包一层 AVPlayerLayer，或用 AVPlayerItemVideoOutput 取帧走 Metal/SpriteKit。",
+      "【Live2D 的「小规模企业豁免」没有公开门槛】官方只说个人与小规模企业免费，但**不公布具体营收/融资数字**，需逐案联系。更要注意：如果 akari 带「可扩展性」（比如允许用户导入自己的模型、或做成 VTuber 工具），会被归类为 Expandable Application，需要单独审批并签发布许可协议。商业化前务必先去信确认，别等做完再谈。",
+      "【macOS 内置中文 TTS 质量不够】本机 180 个语音里中文只有 18 个，且全部 quality=1（低质，Tingting/Meijia 是老式压缩语音）。要做「AI 女友朗读」必须外接 TTS（云端或本地模型），不能指望 AVSpeechSynthesizer 开箱即用。高质量语音需用户手动在系统设置里下载，无法通过 API 静默安装。",
+      "【Plash 已闭源，最好的参考实现没了】曾经的标准答案 sindresorhus/Plash 现在仓库里只剩 readme，DesktopWindow.swift 已不可查。桌面层的实现细节只能靠自己实测（本文的 level 数据即为此而测），网上流传的代码片段多数基于旧版 macOS，务必在 26.x 上重新验证。",
+      "【Tauri 无逐区域命中测试，点击穿透是伪需求陷阱】Tauri 只有全窗口级的 `set_ignore_cursor_events`。要做到「人物身上可点、透明区域穿透」，社区实践是在 Rust 侧以 60fps 轮询鼠标坐标再来回切换该标志——常驻应用上这是持续的 CPU 唤醒与功耗开销，且边缘处手感会有一帧延迟。Swift 侧则可以直接重写 NSView 的 `hitTest(_:)` 按 alpha 判定，干净且零开销。"
+    ]
+  }
+}
