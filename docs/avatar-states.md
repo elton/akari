@@ -184,3 +184,79 @@ ffmpeg -i keyframe.png -vf scale=380:-1 K.png
 ffmpeg -i clip.mp4 -vf "select='eq(n\,0)',scale=380:-1" -frames:v 1 F.png
 ffmpeg -i K.png -i F.png -filter_complex hstack compare.png
 ```
+
+
+---
+
+## 六、素材生产 SOP（完整流程）
+
+按顺序执行，每步都有验收动作。跳过验收就会把问题带到下一步。
+
+```
+① 定妆图    Nano Banana 2 + character 资产 2183420，3:4 / 2K
+                  ↓  验收：构图是否与其他状态一致（人脸占比、身体是否到底边）
+② 视频      Seedance 2.5，1080p / 3:4 / 首尾同帧 / withSoundEffects:false
+                  ↓  验收：定妆图 vs 视频首帧并排比对（见 §五）
+③ retime    tools/retime  1.4× / 30fps
+                  ↓  验收：首尾帧差 < 4
+④ 抠像      tools/matte   Vision 人像分割 → HEVC-alpha
+                  ↓  验收：tools/matte/checkalpha 报告含 alpha
+⑤ 归一化    tools/anchor/normalize  按人脸对齐所有状态
+                  ↓  验收：各状态人脸高度差 < 3%、中心位置差 < 5px
+⑥ 入库      assets/akari/*.mov + anchors.json
+```
+
+### 视频提示词的四条约束（缺一不可）
+
+每一条都是踩过坑之后加上去的：
+
+1. **身份约束** —— 防 Seedance 在首帧重绘人物（§五）。不加会变脸变胖。
+2. **手部锁死** —— "the hand remains completely still and stable in place, never moving,
+   never re-positioning, keeping exactly the same shape and finger arrangement"。
+   手是畸变率最高的部位，锁死后实测四帧手形完全一致。
+3. **几乎静止的空气** —— 控制头发幅度（§四）。写 `gentle` 没用，要写数量、时间尺度、
+   并逐一否定 sweep / flutter / billow / lift。
+4. **背景写死** —— 实测四张里会有一张自己长出户外场景。
+
+**同时**：绝不描述服装或裸露相关的身体部位，会触发 Seedance 内容审核（§2.3）。
+面部结构与比例可以写，不触发审核 —— 这两条不冲突。
+
+### 定妆图的构图要求
+
+**所有状态必须用相同的画布比例与相近的构图**，否则归一化只能对齐人脸，
+对齐不了身体长度 —— 切状态时脸不跳但身体会突然变短。
+
+实际踩到过：`listening` 初版为了裁掉模型自己生成的桌子而砍掉底部 20%，
+导致画布变成 1792×1920 而其余是 1792×2400。归一化后脸对齐了，
+但她的身体比其他状态短一截，贴在桌面上底部会露出空缺。**最后只能重出。**
+
+所以：**不要靠事后裁剪解决桌子问题，要在提示词里就不让它长出来**：
+
+> Absolutely no table, no desk, no chair, no armrest, no furniture, no surface of any kind
+> anywhere in the frame — nothing for her arm to rest on and no horizontal edge across the bottom.
+
+并明确要求身体延伸到底边：
+
+> a full upper-body portrait framed from the waist up, her torso filling the lower half of
+> the frame and continuing all the way down to the bottom edge of the image. She must not be
+> cropped short at the chest.
+
+### 归一化为什么按人脸而不按包围盒
+
+见 [`tools/anchor/README.md`](../tools/anchor)。简述：包围盒被手势污染
+（挥手会撑宽盒子、抬高顶边），而人脸是每个片段里都完整且稳定的唯一地标，
+也是视线真正追踪的东西 —— "她不跳" 在感知上就是"脸不变大变小"。
+
+采样多帧取**中位数**，不用单帧：检测器逐帧有一两像素抖动，
+单帧读数会把抖动固化成永久的缩放系数。
+
+### ffmpeg 滤镜链的两个静默陷阱
+
+都是"exit 0 但结果错了"的类型，只能靠检查输出发现：
+
+1. **透明背景源必须无界**。给 `color` 加 `d=1` 再配 `overlay` 的 `shortest=1`，
+   会把 251 帧的片段截断成 25 帧。
+2. **背景源必须携带输入的帧率**（`r=`）。`color` 默认 25fps，`overlay` 会采用它，
+   把 30fps 的片段静默降到 25fps。
+
+两条都实际发生过，且 ffmpeg 退出码都是 0。

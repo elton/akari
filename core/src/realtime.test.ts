@@ -86,6 +86,12 @@ class FakeRealtime {
     return this.received.map((event) => String(event.type));
   }
 
+  /** Drop the live connections but keep listening, so a reconnect can land. */
+  dropSockets(): void {
+    for (const ws of this.#sockets) ws.close(1006, "test drop");
+    this.#sockets.clear();
+  }
+
   stop(): void {
     this.#server?.stop(true);
     this.#server = null;
@@ -324,6 +330,35 @@ describe("abandoned turns", () => {
     client.appendAudio(new Uint8Array(10 * BYTES_PER_MS));
     client.commitAudio();
     expect(c.abandoned).toEqual([{ reason: "too_short", bufferedMillis: 10 }]);
+  });
+
+  /**
+   * The mid-press check keys off "more was appended this press than is pending",
+   * so anything that empties the buffer without committing it has to reset that
+   * counter too. A dropped socket is exactly that: the audio recorded before the
+   * drop was never sent anywhere, so the release after the reconnect is a turn
+   * nobody heard and has to say so.
+   */
+  test("a press interrupted by a reconnect is still a turn nobody heard", async () => {
+    const c = collectors();
+    let drops = 0;
+    const { server, client } = await connectClient({
+      onTurnAbandoned: (info: RealtimeTurnAbandonedInfo) => c.abandoned.push(info),
+      onDisconnected: () => {
+        drops += 1;
+      },
+    });
+
+    // Key down, two seconds of speech — none of it committed.
+    client.appendAudio(new Uint8Array(2_000 * BYTES_PER_MS));
+    server.dropSockets();
+    await waitFor("the drop", () => drops === 1, 5_000);
+    await waitFor("the reconnect", () => client.connected, 5_000);
+
+    // Still holding the key; the release lands on a session that never heard it.
+    client.commitAudio();
+
+    expect(c.abandoned).toEqual([{ reason: "too_short", bufferedMillis: 0 }]);
   });
 
   test("speech after a mid-press pause is committed onto the live response", async () => {
