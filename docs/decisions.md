@@ -577,3 +577,38 @@ private struct PlaybackRun { let ticket: UInt64; var pending: Int }
 - **spawn 锁的互斥只有同进程双 fd 的单元测试**，没有两个真 app 实例的实测。
 - 上一节「compiles and is wired, but not yet exercised」里的那些（麦克风采集、
   扬声器播放、屏幕上的形象、确认卡片）本轮同样没有变化。
+
+---
+
+## ADR-009 · 三档推理：语音走 DashScope、文本走用户自己的 CF、本地 MLX 兜底
+
+**日期**：2026-08-19  ·  **状态**：已确定
+
+**决策**：推理分三条独立的路径，各自可在设置界面切换：
+
+| 用途 | 默认路径 | 凭据来源 |
+| --- | --- | --- |
+| **语音对话** | DashScope `qwen3.5-omni-flash-realtime` | 用户的 DashScope API key |
+| **文本 / 看截图** | **用户自己的 Cloudflare Workers AI** `@cf/qwen/qwen3.8-27b` | 用户的 CF account id + API token |
+| **兜底（断网 / 额度耗尽 / 隐私模式）** | 本地 MLX `orcarouter/Qwen3.8-27B-Uncensored-MLX` 6-bit | 无 |
+
+**为什么语音不能一起走 CF**：CF Workers AI 有 ASR（`@cf/deepgram/flux`、
+`@cf/openai/whisper-large-v3-turbo`）、有 TTS（`@cf/deepgram/aura-2-*`）、有 LLM，
+但**没有端到端 Realtime**。而 ADR-004 选 Realtime 的全部理由就是它服务端包办了
+VAD 与打断（实测首包 473ms）。改走 CF 就必须退回拼装方案：
+自己实现帧级 VAD、语义端点、打断三件事同步、以及 AEC —— 调研点名「最容易做砸的一块」，
++5–8 人天，且延迟退到 p50 650–900ms。
+
+**接受的代价**：用户要配置**两套凭据**（DashScope key + CF account/token）。
+首启引导需要把这件事讲清楚，不能让用户以为配一个就能用。
+
+**为什么文本要换成用户自己的 CF 账号**：产品若要分发给他人，
+不能内置作者的凭据。文本推理是用量最大、最需要按用户计费的部分，
+放在用户自己的 CF 账号下最干净；CF 免费额度对个人日常用量也够。
+
+**衍生工作**：
+1. Provider 抽象要从「接口已定义、实现只有 DashScope」补齐到三个实现
+2. 设置界面要能独立切换每一路，并显示当前额度 / 连通状态
+3. 本地路径需要下载 22.8 GB 权重 —— 该 HF repo 是 **gated**，
+   需用户先申请访问并 `huggingface-cli login`，这一步无法由程序代劳
+4. 自动降级策略：网络不可用或 CF 额度耗尽时自动切本地，并在界面明示当前在用哪一档
