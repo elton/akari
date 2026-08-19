@@ -423,3 +423,157 @@ Team ID，本项目还没有。所以：
 | SIGKILL 掉 app 时的孤儿 core | 无解，只能靠 core 侧 5 秒轮询的看门狗兜底 |
 | RED 确认门从未被真人点过 | 需要 GUI 会话；目前只有 fake app 驱动的自动化覆盖 |
 | 麦克风采集 / 扬声器播放 | 需要真机 GUI + 麦克风；语音闭环目前用合成语音灌入验证 |
+
+---
+
+## 第二轮：对抗性验证之后的收口
+
+**日期**：2026-08-19  ·  **状态**：已落地并合并
+
+第一轮那 17 条修完之后又做了一次**对抗性验证**（不看修复者的自述，逐条实跑）。
+结论是 15 条真修好了，2 条只修了一半，另有 4 条是第一轮的修复**新引入**的。
+本节记的是第二轮把这 6 条清掉的过程，以及为什么其中有些的修法与审查建议不同。
+
+**这一轮的纪律是：每条修复都要有一个能复现该问题的测试，并且要在隔离副本里把
+修复撤掉重跑，确认那个测试真的会红。** 只会变绿的测试证明不了任何事 —— 这一轮
+里就有两个测试在撤掉修复后依然通过，都被重写或作废了。
+
+### 1. 信任边界只做了一个方向（P1，第一轮引入）
+
+见上面第一条的「补记」，两个方向的档位对照表也在那里。这里只补三件本轮实测到的事：
+
+- **对抗复现是真跑的，不是单元测试**：一个普通 bun 脚本 bind 住某个 socket 路径，
+  用 `AKARI_SOCKET` 把**真实 app 二进制**指过去。目录 0777 时 app 拒绝拨号，
+  日志一行 `refusing to connect to the core socket: … is mode 0777, expected 0700`，
+  假 core 从头到尾没收到 `app.hello`，剪贴板没出去。
+- **对照组同样是真跑的**：同一个假 core 换到 0700 目录 + 0600 socket，app 就连上了，
+  握手完成，`clipboard.read.request` 拿到了剪贴板全文。**这正是上表「挡不住同一个
+  uid 的进程」那一格的实测证据** —— 写在这里而不是藏起来，因为读者需要知道这道
+  校验的上限在哪。
+- **`CoreProcess.probeSocket` 不走这道校验**（见下面第 2 条）：它对 socket 做一次
+  `connect(2)` 就挂断，不发任何字节。抢占了路径的进程因此能知道 app 起来了，也能
+  让 app 不去自启 core。这是 P3，记在下面的遗留表里。
+
+### 2. app 会抢掉手工起的 core，多开一条计费会话（P2，第一轮引入）
+
+第一轮给 app 加了「core 没起就自己拉一个」。判据是错的：它问的是「2 秒之后我的
+握手完成了吗」，而握手完成的时刻由 app 自己的重连退避决定（累计 0 / 0.25 / 0.75 /
+1.75 / 3.75s），跟「这台机器上有没有 core」是两件事。开发时 `make run-core` 起的
+core 会被顶掉，被顶掉的那个挂着一条**按时长计费**的 Realtime 会话，且永远等不到
+客户端。
+
+改成问内核，不问钟：对 socket 做一次非阻塞 `connect(2)`。
+
+| connect 的结果 | 判定 | 动作 |
+| --- | --- | --- |
+| 成功 / `EAGAIN`（backlog 满） | `serving` | 有人在服务，绝不 spawn |
+| `ENOENT` | `absent` | 没有 core |
+| `ECONNREFUSED` | `stale`（core 被 SIGKILL 留下的死 inode） | 可以 spawn |
+| 其他（`EACCES` / `ENAMETOOLONG` / `ENOTDIR`） | `unusable` | 不 spawn，起一个也修不好 |
+
+- `grace`（默认 5s，每 200ms 复问）只覆盖「core 正在 bun 冷启动、还没 bind」，
+  任何一次探测成功即刻退出。方向上偏保守是免费的（最多晚点自启），偏激进的代价
+  是多一条计费会话。
+- spawn 前用 `flock(LOCK_EX|LOCK_NB)` 抢 `core.spawn.lock`，两个 app 实例不会同时
+  拉起。用 `flock` 而不是 pid 文件：进程死了内核自动释放。
+- **陈旧 socket 只识别、不删**。app 侧 unlink 与 core 侧 bind 之间有 TOCTOU 窗口，
+  可能误删正在服务的 socket；`Bridge.listen` 本来就会在 bind 时 unlink 死 inode，
+  那里没有这个窗口。这一条与审查建议不同，是刻意的。
+- 探测路径与拨号路径统一走 `SocketTrust.resolveSocketPath()`，永不漂移，发布版
+  同样不认 `AKARI_SOCKET`。
+
+**一个可预期的副作用**：每次成功探测会在 core 的审计日志里留一行
+`AUDIT peer refused … the kernel would not report the peer's identity`。因为我们
+连上即挂断，`peer.ts` 来不及取 `LOCAL_PEERPID`。它看着像入侵但不是。**它同时是
+好事**：core 在给出唯一那个 client 名额之前就丢弃了探测连接，所以探测永远不可能
+顶掉 app 自己的真连接（实测 refused 与 accepted 相差 1ms，握手正常）。
+
+**实测**：app 先起、1.85 秒后手工 `bun run src/index.ts` —— 12 秒后
+`pgrep -f src/index.ts` 只有 1 个进程，且 app 连的就是那个手工 core。
+
+### 3. 退出 app 会连带杀掉手工起的 core（同上，用户明确要求改掉）
+
+`applicationWillTerminate` 现在只在 `core.isSupervising`（这个 core 是 app 自己
+spawn 的、带 `AKARI_SUPERVISED=1` 的那一个）为真时才发 `app.quit`。手工起的 core
+看到的只是一次普通掉线。`protocol.md` §3.6 已同步。
+
+**实测**：让一个假 core 给 app 发 `app.quit`（走真协议帧）逼它走优雅退出路径 ——
+当前构建**不回** `app.quit`；同一实验对着撤回修复的构建跑，假 core 收到了
+`RECV app.quit`。
+
+### 4. 播放队列的账本会漏一个计数（P2，第一轮引入）
+
+换耳机、拔插外接显示器，或用户打断（barge-in）恰好撞上一帧音频入队时，形象会
+**永久卡在 talking**：`pendingBuffers` 的计数被留下一个孤儿，`isPlaying` 永远为真，
+`onPlaybackFinished` 不再触发，`audio.done` 不再发出。断线重连也救不回来 —— core
+重连后 streamId 从 1 重新开始，新 stream 1 直接继承了那个残留计数。
+
+审查建议「把读代次和自增放进同一个临界区」。实际采用的是更强的**票据（ticket）**
+方案，理由是合并临界区修不好第二半：`beginPlaybackStream` 清掉 `pendingBuffers`
+之后，旧 stream 还在飞的 buffer 其代次与当前代次相同，会去减新 stream 的计数。
+
+```swift
+private struct PlaybackRun { let ticket: UInt64; var pending: Int }
+```
+
+票据在**第一次把某个 buffer 计入某个 stream 的那个临界区里**铸出，队列每被重置
+一次（`cancelPlayback` / `beginPlaybackStream`）就作废。completion 的票据对不上就
+直接忽略：不减、不删。`playbackGeneration` 字段整个删掉了 —— 票据严格强于代次
+（代次只能区分 flush 前后，票据能区分「这一轮 / 那一轮」），净结果少一个字段。
+
+顺带改正了一条假前提的注释：`cancelPlayback` 的调用方**不是**串行的。
+`AVAudioEngineConfigurationChange` 的两个观察者用 `queue: nil` 注册，在发帖线程
+执行，与主 actor 上的 `enqueuePlayback` 真正并发。保证账本正确的是票据，不是
+调用方纪律。
+
+**撤销复跑**：独立写的四生产者压测（`AdversarialPlaybackStressTests`）在撤回票据、
+改回代次方案的隔离副本上，**第 0 轮**就抓到四条流各留 1 个孤儿计数，连跑 3 次都是
+第 0 轮；修复版连跑 3 次全绿。写这个测试的过程本身也是个教训：第一版在每轮末尾
+补了一次 `cancelPlayback`，那会把要找的孤儿冲掉，于是它在撤销版上照样通过 ——
+改成「不 flush，等账本自己归零」之后才有意义。
+
+### 5. 说话中间停顿再松手会弹「没听清」（P2，第一轮引入）
+
+`silence_duration_ms: 800`，所以说话中间正常停顿一下，服务端 VAD 会在**按键还按着**
+的时候就 commit 并开始回答。松手时缓冲区里只剩停顿之后的那几帧，第一轮的修复据此
+判定「按得太短」，弹一句「没听清」——这句提示既是假的（她听清了，正在回答），又会
+诱导用户重按一次，从而**真的**打断她。
+
+修法是加一个**按压级**字节计数器 `uplinkBytesSincePress`：`appendAudio()` 累加，
+只有 `commitAudio()` 清零；而 `uplinkBytesSinceCommit` 会被**每一次**
+`input_audio_buffer.committed` 清零，包括服务端自行提交的那次。于是
+`appendedThisPress > pending` 精确等价于「这次按压期间落过一次 commit」，
+三种情况自然分开：整轮没说话时两者严格相等（→ abandon）；中途被提交时严格大于
+（→ 静默返回，回答已在路上）；未连接走在更前面的分支。
+
+**没有采用**「看 `activeResponseId` 是否非空」的建议，它有两个真实漏口：停顿触发的
+回答可能先于松手结束（`response.done` 已到，字段归 null）；停顿后又蹦出一个很短的
+词会触发 server_vad 打断，`response.done{cancelled}` 同样把字段归 null。按压级计数
+不依赖回复的生命周期状态。
+
+`onSocketClosed()` 里也一并清零 `uplinkBytesSincePress`：掉线前 append 的音频从未被
+提交，重连后松手必须仍算作丢掉的一轮，而不是被误判成「中途已提交」。这一条本轮
+补了测试（`a press interrupted by a reconnect is still a turn nobody heard`），
+撤掉那一行赋值它就红。
+
+这条修复**不需要** `core/src/index.ts` 配合改动：`onTurnAbandoned` 的 reason 集合
+没变（仍是 `not_connected` | `too_short`）。
+
+### 本轮的遗留（P3，本轮不修）
+
+| 事项 | 说明 |
+| --- | --- |
+| `probeSocket` 不做 `SocketTrust` 校验 | 抢占了 socket 路径的同 uid 进程能知道 app 启动了，并让 app 不去自启 core。不泄漏任何字节（连上即挂断）。属于「同 uid 攻击者」那一格，与主结论同级 |
+| barge-in 后可能漏出一帧（20ms）音频 | `cancelPlayback` 的 `player.stop()` 返回之后、并发的 `enqueuePlayback` 才调到 `scheduleBuffer` + `play()`。关掉它要在 AVFoundation 调用上加锁，代价大于收益 |
+| `cancelPlayback(nil)` 不会把「尚无 buffer 的流」加进忽略名单 | ids 取自 `pendingBuffers.keys`。目前只有全局 flush 走这条路，之后不会再有帧进来 |
+| 停顿触发的回答**播完之后**才松手 | 若此时新音频 ≥100ms，会正常 commit 一段室内噪声并 `response.create`，她可能对着静音答一句；若 <100ms 则静默返回，形象停在 thinking。后者需要「整段回答在 commit 后 100ms 内播完」，实际不可达，但机制上确实没有兜底 |
+| app 先起并自启了 core 之后，开发者再手工 `make run-core` | 新 core 仍会无条件 unlink 抢走 socket。根治点在 `core/src/bridge.ts` 的 unconditional unlink |
+| 手工 core 冷启动超过 5 秒才 bind | app 仍会多起一个。这是 `grace` 的固有上限 |
+
+### 本轮没有验证的部分
+
+- **app 自己 spawn core 的那条路径没有跑真实端到端** —— 那会真的开一条计费 Realtime
+  会话。该路径除新增的计数器与 `flock` 之外未改动。
+- **spawn 锁的互斥只有同进程双 fd 的单元测试**，没有两个真 app 实例的实测。
+- 上一节「compiles and is wired, but not yet exercised」里的那些（麦克风采集、
+  扬声器播放、屏幕上的形象、确认卡片）本轮同样没有变化。

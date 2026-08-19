@@ -328,6 +328,9 @@ GREEN 级工具不产生任何消息。
 #### `app.quit` — 双向，无 payload
 
 - app → core：用户从菜单栏选了退出。core 应收尾并退出进程。
+  **仅当这个 core 是 app 自己拉起来的**（即带 `AKARI_SUPERVISED=1` 的那一个）
+  才发这一帧。开发者手工 `make run-core` 起的 core 不归 app 管，退出 app
+  不应该把它一起带走 —— app 只是关掉自己那条连接，core 看到的是普通掉线。
 - core → app：core 主动要求 app 退出（例如致命配置错误）。
 
 发送方在发出后可直接开始退出，不等对方确认。

@@ -6,14 +6,18 @@ agent that can actually operate your Mac.
 
 Powered by Qwen.
 
-> Status: **P0 skeleton runs end to end, now with the security review applied.** A
+> Status: **P0 skeleton runs end to end, hardened over two review rounds.** A
 > synthesized utterance pushed in over the socket comes back as spoken audio in
 > 437ms, and function calling works. Two review passes (correctness + security)
-> found 27 issues; every P2-and-above one is fixed — see
+> found 27 issues and the first round fixed the 17 that were P2-or-above. An
+> adversarial re-check of that round found 2 half-fixes and 4 problems the fixes
+> had themselves introduced; the second round closed those and re-ran every claim
+> against the real binaries. Both rounds are written up in
 > [the hardening record](./docs/decisions.md#p0-骨架的安全加固). What that
 > record is careful about is worth repeating here: the socket is checked from
 > both ends, but neither check is isolation until this project has a signing
-> identity — and the app→core half is the weaker of the two. See
+> identity — and the app→core half is the weaker of the two: it stops another
+> user, it does not stop a process already running as you. See
 > [Status](#status) for what is verified and what is not.
 
 ## Why the name
@@ -175,7 +179,11 @@ already taken by something else.
 | Audit trail | Written 0600 beside the socket; each entry names the tool, the effective risk, whether a human confirmed it, and the pid/uid/path of the client that was attached |
 | Orphan watchdog | The parent was SIGKILLed with the core running under `AKARI_SUPERVISED=1`; the core noticed the reparent and shut itself down within 5s |
 | Core assembly | `core/src/index.test.ts` spawns the real entry point and drives it over a real socket — socket and audit modes, the peer audit line, an abandoned turn returning to `idle`, a missing key costing the voice but not the socket, `app.quit`, unknown-type tolerance |
-| Test suite | `make check`: `swift build` (zero warnings) + 38 `swift test` + `tsc --noEmit` + 154 `bun test` |
+| App refuses a fake core | A plain bun script bound a socket and the **real** `akari` binary was pointed at it with `AKARI_SOCKET`. Directory 0777 → the app never dialled: no `app.hello`, no clipboard, and `refusing to connect to the core socket: … is mode 0777, expected 0700` in the log. The control run — the same fake core at 0700/0600 — *does* get the session and *does* get the clipboard, which is the honest measure of what this check buys |
+| No second core, no second billed session | App started first, a hand-run core 1.85s later. 12s on, `pgrep -f src/index.ts` showed exactly one process and the app was attached to it |
+| A hand-run core outlives the app | Killing the app left the hand-run core running and its log said `app disconnected`, not `app.quit`. Driven again through the graceful path (a fake core sending `app.quit` to make the app terminate): the current build sends no `app.quit` back; the build with the guard reverted does |
+| Playback ledger under a race | Four producers flooding buffers while a cancel and a stream reopen land from other threads, asserted with no flush to hide the evidence. Green on the fix; the reverted build strands an orphan count on all four streams in round 0, 3 runs out of 3 |
+| Test suite | `make check`: `swift build` (zero warnings) + 80 `swift test` + `tsc --noEmit` + 160 `bun test` |
 
 ### Compiles and is wired, but not yet exercised
 
@@ -245,6 +253,16 @@ Unlock the machine, then:
    She must say the content was marked secret and skipped, and must not read it out.
 10. Force-quit akari (Activity Monitor → Force Quit, i.e. SIGKILL) while it is running
    and `ps aux | grep akari-core`. Within ~5s no core should be left behind.
+11. Speak, **pause mid-sentence for about a second**, then release ⌥Space. She should
+   answer normally and the menu bar must **not** say "按得太短了…" — she heard you,
+   and that message would invite a second press that really would cut her off.
+12. `make run-core` in one terminal, then start the app. Only one core process may
+   exist (`pgrep -fl src/index.ts`). Quit the app from the menu bar: the hand-run
+   core must still be running.
+13. While she is talking, unplug or swap the audio output device (headphones out,
+   or disconnect an external display that carries audio). She must come back to
+   `idle` when the reply ends — a stuck `talking` means the playback ledger kept
+   an orphan count.
 
 ## Documents
 
