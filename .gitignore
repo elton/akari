@@ -4,6 +4,7 @@
 
 # Build
 build/
+.build/
 dist/
 target/
 DerivedData/

@@ -141,3 +141,46 @@ assets/
 
 `listening` 状态：6s 生成 → retime 1.4× → **8.37s / 30fps**，
 再经 `tools/matte` 抠像为 HEVC-with-alpha。
+
+
+---
+
+## 五、Seedance 会在首帧重绘人物（重要，会影响所有素材）
+
+`keyframes.start` **不是像素级锁定第一帧** —— Seedance 会按自己的理解重绘一遍人物。
+
+实测证据（`idle` 状态）：把定妆图原图与生成视频的首帧/中段/尾帧并排对比，
+**从定妆图到视频首帧，脸就已经变宽变圆了**，之后整段视频维持这个新脸型。
+也就是说这不是"生成过程中逐渐漂移"，而是**转换的第一步就发生了身份偏移**。
+
+### 什么情况下会暴露
+
+- **正面或接近正面的姿态最容易暴露** —— 脸宽的变化在正面视角下最显眼
+- **侧脸姿态不容易暴露** —— 同一批生成的 `thinking`（侧脸、眼神上飘）就没有明显变化
+
+所以不能因为某一条素材看起来正常，就假设整批都没问题。**每条素材都要单独比对定妆图。**
+
+### 对策：提示词里显式钉住面部结构
+
+只写动作是不够的，必须在提示词开头加一段身份约束：
+
+> IDENTITY MUST NOT CHANGE: reproduce the person in the first frame exactly.
+> Her face keeps precisely the same shape, width, jawline and chin as in that frame —
+> do not widen, round, soften or fill out her face; do not alter her cheekbones or the
+> slimness of her jaw. Her body proportions, shoulder width and silhouette stay identical
+> to the first frame throughout. Every frame must look like the same photograph, only alive.
+
+注意这与 §2.3 的「只写动作，不写服装或身体部位」并不矛盾：
+那条规则是为了规避内容审核（审核卡的是**裸露相关**的身体部位描述），
+而这里写的是**面部结构与比例**，不触发审核。实测这段约束能通过审核。
+
+### 验收步骤（必做）
+
+每生成一条素材，把**定妆图原图**与**视频首帧**并排比一次。
+不要只看视频内部各帧是否一致 —— 首帧本身就可能已经偏了。
+
+```bash
+ffmpeg -i keyframe.png -vf scale=380:-1 K.png
+ffmpeg -i clip.mp4 -vf "select='eq(n\,0)',scale=380:-1" -frames:v 1 F.png
+ffmpeg -i K.png -i F.png -filter_complex hstack compare.png
+```

@@ -305,3 +305,121 @@ Seedance 2.5 的 `references` 同样支持 `character` 类型，所以图像与�
 **提示词纪律**：实测发现模型会擅自把纯白背景换成户外场景（四张里出现一张）。
 正式生产的提示词必须包含硬性负面约束：
 "no scenery, no furniture, no plants, no windows and no change whatsoever"。
+
+---
+
+## P0 骨架的安全加固
+
+**日期**：2026-08-19  ·  **状态**：已落地并合并
+
+不是一条新的方向性决策，而是 P0 骨架跑通之后两路代码审查（正确性 + 安全性）
+报出的 27 条问题里 P2 及以上的那 17 条的落地记录。之所以写进本文件，是因为其中
+几条**改变了既有 ADR 在实现层面的含义** —— 尤其 ADR-002 的确认门，在加固之前
+是不成立的。
+
+### 一、确认门此前形同虚设（ADR-002 的实现前提）
+
+ADR-002 说"每一件有风险的事都先问过你"。而在加固之前，socket 对连上来的进程
+**不做任何身份检查**：机器上任何一个以用户身份运行的程序都能冒充 akari.app 接管
+这条通道，自己收到 RED 确认卡片、自己回 `approve`，用户全程看不到。同样地，它
+也能灌假麦克风音频，或者顶掉真 core、截走全部上行语音。
+
+现在 core 在 `connect(2)` 那一刻向内核查询对端身份
+（`LOCAL_PEERCRED` / `LOCAL_PEERPID` + `proc_pidpath`），只接受 uid 相符且可执行
+文件在白名单内的进程，其余一律拒绝并记审计行。socket 与其目录被强制锁到
+0600/0700（不再看开发机 umask 的脸色），锁不上就拒绝启动。
+
+#### 补记（同日，第二轮）：这条校验当时只做了一个方向
+
+第一轮只让 **core 验 app**，没让 **app 验 core**，而 socket 有两端。对抗验证一次
+就打穿了：写一个没有任何权限的普通 bun 脚本监听一个 socket，用 `AKARI_SOCKET`
+把 app 指过去，app 直接连上、握手、然后把剪贴板全文交了出去 —— 没有确认卡片，
+没有用户介入。这正好把第一轮"把剪贴板读取挪到 app 侧"（见下面第三条）的理由
+掏空了：app 能看见 `ConcealedType` 标记没有用，如果它肯把内容交给任何一个抢占了
+socket 路径的进程。
+
+补上的是 `SocketTrust`（`app/Sources/AkariApp/SocketTrust.swift`）：app 每次拨号
+之前先 `lstat` socket 与其所在目录，要求**属主是自己、socket 0600、目录 0700、
+两者都不是符号链接、socket 确实是 socket**，任何一条不符就不连、退避重试、按
+原因去重打日志。这是 core 侧 `assertPrivate` 的镜像，两端现在校验同一条不变量。
+同时 `AKARI_SOCKET` 收进 DEBUG（与 `AKARI_CORE_ROOT` / `AKARI_BUN` 同一条规矩）：
+GUI 进程的环境变量是谁启动它谁说了算，发布版从环境里取 socket 路径，等于把
+"启动 akari"变成"连到我指定的这条通道上"。**只加一个"我知道我在做什么"的开关
+没有意义** —— 能设 `AKARI_SOCKET` 的人顺手就把开关也设了。
+
+**两个方向的档位并不对称，必须分开说。**
+
+| 方向 | 现在校验什么 | 挡得住 | 挡不住 |
+| --- | --- | --- | --- |
+| core 验 app | 内核报告的 uid + `proc_pidpath` 可执行文件白名单 | 别的用户；本机上没准备的进程；非管理员改不动 `/Applications/akari.app` 里的二进制 | 同 uid 且能覆写开发树路径的攻击者；pid 回收的窗口 |
+| app 验 core | `lstat` socket 与其目录的属主 / 模式 / 类型 + 发布版忽略 `AKARI_SOCKET` | 别的用户的 socket；`/tmp` 之类谁都能写的目录；靠环境变量改道 | **同一个 uid 的进程** —— 它可以 unlink 掉真 socket，在同一个 0700 目录里 bind 一个同样 0600 的自己的 socket，`stat` 分辨不出来 |
+
+app 这一侧**没有**去读 `LOCAL_PEERPID` 反查 core，这是权衡后的取舍，两条理由：
+
+1. `NWConnection` 不暴露 fd。要拿到 fd 就得把 socket、写背压、增量分帧全部自己
+   写一遍 —— 而且是在跑实时音频的那条路径上。风险大，收益见下。
+2. 就算做了也换不来多少东西。core 是**脚本**，对端可执行文件是 `bun`，而 bun 装在
+   用户可写的目录里（`~/.bun/bin`、`/opt/homebrew/bin`），谁都能拿它跑任何文件。
+   "对端是个 bun"证明不了它是 akari-core。同一个路径档，用在 app 身上（bundle 里的
+   真二进制）比用在 core 身上有意义得多。
+
+所以这两个方向都停在同一个地方：**真正能结束这件事的是代码签名档**，见下。
+
+**这是过渡方案，不是解决方案。** 真正的隔离要校验运行中进程的代码签名
+（`SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidity`），需要 Apple Developer
+Team ID，本项目还没有。所以：
+
+- pid 不是身份（可回收）、路径不是身份（可覆写）——**挡得住没准备的本地进程，
+  挡不住认真的本地攻击者**；这句话对**两个方向同时成立**，app 侧那半尤其弱：
+  它对同 uid 的攻击者基本没有防护；
+- `codesign` 档位是**声明了但故意抛错拒绝启动**的，绝不用一个"跑 `codesign` 校验
+  磁盘文件"的退化版冒充它 —— 那和路径档是同一个 TOCTOU 洞，只是换了个好听的名字；
+- 当前档位每次启动都打进日志，README 里也写明。
+
+拿到 Team ID 之后要做的事已经准备好：`PeerIdentity.auditToken`（32 字节
+`audit_token_t`）已经在采集了，接上去即可。
+
+### 二、发布版只执行包内的 core
+
+旧实现从可执行文件位置向上搜 8 层找 `core/package.json`。core 是 akari 的信任
+中心（socket 服务端、确认卡片的内容、麦克风上行、`DASHSCOPE_API_KEY`），所以
+"把 .app 放进下载目录"就等于"谁能往 app 旁边写一个文件夹，谁就能让 akari 替他
+执行代码"。现在发布版只认 `Contents/Resources/core`，且从 `.app` 里运行时一律不
+向外搜；`AKARI_CORE_ROOT` / `AKARI_BUN` 覆盖仅在 DEBUG 生效。
+
+### 三、剪贴板读取移到 app 侧（协议 §3.7 两侧均已实现）
+
+`pbpaste` 看不见 `org.nspasteboard.ConcealedType` / `TransientType` —— 密码管理器
+就是用这两个 UTI 标记它复制出去的密码。core 侧读一次，用户的主密码就可能进了云端
+模型的日志。现在这一读发生在 app 侧（`NSPasteboard.general.types`），带标记就
+**根本不去读文本**，只回一句"已跳过"。`clipboard_read` 因此从 🔴 RED 降为 🟢 GREEN
+—— 降级的依据是能力变强了，不是要求变松了。
+
+### 四、注入防御从"改东西"扩到"往外送东西"
+
+原实现只在 `mutating` 的工具上做 untrusted 升级。"读一下剪贴板，然后搜一下"是
+两次只读调用、零 mutation、全量泄漏。现在 `readsSensitive` / `exfiltrates` 与
+`mutating` 并列，三者任一都会在污染上下文里升到 RED。
+
+### 五、其余（不改变任何 ADR，只是修 bug）
+
+- 断线重连后播放流被上一次会话的"取消名单"误杀 —— 她张嘴不出声且永远卡在 talking。
+- 首启授权弹框期间松手会导致麦克风常开；授权移到启动时，按键路径上不再有异步步骤。
+- RED 卡片加了 600ms 防误触 + 命令看全才能批准，回车默认落在**拒绝**上。
+- Realtime 的 `response.done{failed}` 与"短按/未连接"两条路径此前不终结回合，
+  形象永久停在 talking / thinking；现在都会收尾并通过新增的 `ui.notice` 告诉用户原因。
+- 子进程不再继承完整环境（白名单 9 项），密钥不会流进 `pbpaste` / `open`。
+- Realtime 端点做了白名单校验，改不动 `.env` 就改不了凭据的去向。
+- app 被强杀后遗留的孤儿 core 会自己退出（`AKARI_SUPERVISED` + 父进程看门狗），
+  不再挂着一条按分钟计费的 Realtime 会话。
+- 工具调用落盘审计（JSONL，0600），每条记录附带当时连着的是哪个客户端。
+
+### 遗留
+
+| 事项 | 卡在哪里 |
+| --- | --- |
+| `codesign` 档位的对端校验（core 验 app） | 需要 Apple Developer Team ID |
+| app 验 core 仍挡不住同 uid 的进程 | 同上；`stat` 到此为止，`LOCAL_PEERPID` 反查换不来实质保护（对端可执行文件是 `bun`） |
+| SIGKILL 掉 app 时的孤儿 core | 无解，只能靠 core 侧 5 秒轮询的看门狗兜底 |
+| RED 确认门从未被真人点过 | 需要 GUI 会话；目前只有 fake app 驱动的自动化覆盖 |
+| 麦克风采集 / 扬声器播放 | 需要真机 GUI + 麦克风；语音闭环目前用合成语音灌入验证 |
