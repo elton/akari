@@ -32,7 +32,9 @@
 **Seedance 2.5 的能力对本方案的意义**（已通过 `video_models_list` 核实）：
 - 支持 `keyframes.start` + `keyframes.end` → **首帧与尾帧用同一张图，即可得到无缝循环**
 - 时长 4–30s，分辨率至 1080p
-- `outputFormats: mp4, mov` → **`.mov` 是否携带 alpha 通道待验证**（关键技术风险，见 RISK-1）
+- `outputFormats: mp4, mov` → ~~`.mov` 是否携带 alpha 通道待验证~~
+  **已证伪（2026-08-19 实测）**：`outputFormat: "mov"` 参数被服务端忽略，
+  实际返回 `h264 / yuv420p / .mp4`，无 alpha。抠像环节必须保留，见 ADR-007
 - `audioReferences` 支持 `lipsync` / `voiceover_sync`，最多 10 段音频、单段至 60s，
   且 `requiresVisualReference: false` → 口型质量可能显著优于原先预期
 
@@ -112,7 +114,7 @@
 
 | ID | 风险 | 为什么关键 | 如何证伪 |
 | --- | --- | --- | --- |
-| RISK-1 | Seedance 2.5 输出的 `.mov` 是否携带 alpha 通道 | 决定角色能否真正"抠像"贴在桌面上，还是只能带背景显示 | 实际生成一段短视频，`ffprobe` 检查 pix_fmt 是否为 `yuva*` / 编码是否为 ProRes 4444 |
+| ~~RISK-1~~ | ~~Seedance 2.5 输出的 `.mov` 是否携带 alpha~~ | **已关闭**：证伪，无 alpha。对策见 ADR-007 | 已实测 |
 | RISK-2 | macOS 26 上桌面壁纸层窗口是否仍可用 | 决定形象能否"贴在桌面"而不是浮在所有窗口之上 | 写最小 Swift demo 验证 NSWindow.level + collectionBehavior |
 | RISK-3 | 外放场景下的回声消除 | 不做 AEC，麦克风会听到 AI 自己的声音，打断功能直接失效 | 验证 macOS VoiceProcessingIO AudioUnit 实际效果 |
 | RISK-4 | 本地模型端到端延迟 | 决定"切本地"是不是真的可用 | 拉下 6-bit 权重实测首 token 延迟与 tokens/s |
@@ -247,3 +249,59 @@ Seedance 2.5 的 `references` 同样支持 `character` 类型，所以图像与�
 | 定妆图 | 2K | 约 75–100 积分 |
 
 验证与正式必须区分档位，验证环节用 1080p 属于浪费 44%。
+
+---
+
+## ADR-007 · 抠像用 macOS Vision 人像分割，不用 colorkey、也不引入第三方抠像模型
+
+**日期**：2026-08-19  ·  **状态**：已确定  ·  **依据：本机实测**
+
+**背景**：RISK-1 证伪（Seedance 不输出 alpha），抠像成为素材管线的必需环节。
+
+**三个候选与实测结果**：
+
+| 方案 | 结果 |
+| --- | --- |
+| `ffmpeg colorkey` | ❌ **失败，且失败方式有欺骗性**。背景颜色方差仅 8.6（看起来完全适合抠色），但抠出来后**额头、鼻梁、眼下出现空洞** —— 那些皮肤高光的颜色与白背景太接近，而 colorkey 只比颜色、不认语义 |
+| MatAnyone2 / RVM / rembg | 能用，但要引入 Python 依赖与模型权重，且需自行处理时序稳定性 |
+| **macOS Vision 人像分割** | ✅ 语义分割，不打洞；**系统框架、零依赖、跑 ANE**；实测 604×1080 / 145 帧 **8.6 秒** |
+
+**决策**：用 `VNGeneratePersonSegmentationRequest`（`qualityLevel = .accurate`）生成遮罩，
+经 `CIBlendWithMask` 合成透明帧，再用 `AVVideoCodecType.hevcWithAlpha` 编码。
+工具已落地为 [`tools/matte`](../tools/matte)。
+
+**两条必须记住的坑**：
+
+1. **`kVTCompressionPropertyKey_TargetQualityForAlpha` 必须是 `1.0`。**
+   技术调研初稿给的是 `0.1`，经一手核查 Apple 文档纠正：值域 0–1 且 **1 接近无损**。
+   0.1 会让发丝边缘出现锯齿、半透明区块状、边缘暗环。
+2. **`ffprobe` 在这里会骗人。** 它对 HEVC-alpha 报 `pix_fmt=yuv420p`，
+   因为 alpha 走的是**辅助图层**（auxiliary picture layer），不在主层像素格式里。
+   唯一权威的检查是 AVFoundation 的 `.containsAlphaChannel`
+   —— 实测原始 Seedance 输出为 0，经本工具处理后为 1。
+
+**已知待改进**：Vision 遮罩分辨率低于原帧，放大插值后边缘过渡区混入背景色，
+在深色壁纸上表现为头发外围一圈暗边。修法：遮罩轻微腐蚀 + 边缘去溢色。
+
+---
+
+## ADR-008 · 形象定稿
+
+**日期**：2026-08-19  ·  **状态**：已确定
+
+经四轮迭代定稿。**关键在于用户的三条反馈推翻了我最初的方向**：
+姿势太僵硬（证件照式正面站姿）、表情太拘谨、服装太正式且缺乏张力。
+
+**定稿形象**：
+- **姿态**：身体侧转约三十度，头转回镜头，肩线一高一低 —— 杂志封面式的三七身，不是正面站姿
+- **表情**：明亮外向，露齿笑，眼神有神
+- **服装**：一字肩修身米白罗纹针织，露出肩线与锁骨，细金手镯
+- **背景**：纯白棚拍
+- **比例**：3:4（不是 9:16 —— 那是手机比例，人物两侧与头顶会空掉一大片，同清晰度下多耗 25% 像素）
+
+**衍生的技术风险**：定稿配色是**米白衣服 + 裸露肩颈 + 白背景**，三者都是浅色，
+抠像难度显著高于之前测试用的深蓝毛衣。因此正式素材前须先用 720p 验证分割质量。
+
+**提示词纪律**：实测发现模型会擅自把纯白背景换成户外场景（四张里出现一张）。
+正式生产的提示词必须包含硬性负面约束：
+"no scenery, no furniture, no plants, no windows and no change whatsoever"。
