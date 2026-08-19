@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+*.swp
+
+# Build
+build/
+dist/
+target/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Deps
+node_modules/
+.venv/
+__pycache__/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local media / model weights (large binaries)
+assets/local/
+models/
+*.mp4
+*.mov
+*.safetensors
+*.gguf
