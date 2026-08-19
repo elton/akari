@@ -664,3 +664,141 @@ VAD 与打断（实测首包 473ms）。改走 CF 就必须退回拼装方案：
   确认 core 日志中 `ptt.down` 早于第一个上行音频帧。
 
 `make check`：swift build 零警告 / swift test 80 passed / typecheck 干净 / bun test 162 pass 0 fail。
+
+---
+
+## ADR-009 实施记录：三档推理接起来了
+
+**日期**：2026-08-19  ·  **状态**：已落地（本地那一档除外，权重没下完）
+
+三个实现是并行做出来的（CF provider、本地 provider + 降级路由、设置界面 +
+Keychain），这一条记录把它们接起来时**真正发生的事**，以及每一句话的证据等级。
+
+### 接线补了什么
+
+三份代码各自完整，中间是空的：
+
+| 缺口 | 补法 |
+| --- | --- |
+| `bridge.ts` 完全不认识 `settings.*` / `credentials.*`，它们掉进 `default:` 被当成未知类型忽略 | 新增五个入站分支 + `sendSettingsState()` / `requestCredentials()`。回 `replyTo` 的记账留在 bridge 里，handler 只返回要回的 payload |
+| `index.ts` 里没有 `createProviders()`，也没有 router、没有 resolver | 全部接上。`TEXT_PROVIDER_IDS` 的顺序就是降级顺序：CF → 本地 |
+| 语音那一路没有 `ProviderHealth` 的来源（它不是 `TextProvider`） | 新增 `core/src/settings.ts`：`SettingsService` 从凭据解析结果 + 一个 4 方法的 `VoiceSession` 缝算出语音行 |
+| `configFromEnv()` 只认 `process.env.DASHSCOPE_API_KEY`，override 补不上 | 改成 `overrides.apiKey ?? process.env…`。否则「凭据走 socket」对语音就是一句空话 |
+| `RealtimeClient` 无法换 key | 新增 `setApiKey()` + `RenewReason: "credentials"`。key 只用在 WS 握手上，所以换 key 必然换 socket —— 但仍然走 `maybeRenew()` 等回合边界，中途断会丢掉用户正在说的那句 |
+
+### 接线时发现的四个问题（都已修）
+
+**1. [P1] shell 里的环境变量悄悄压过 `.env`，症状是「curl 能跑、程序 401」。**
+`loadEnvFile` 遇到已存在的变量就跳过（常规 dotenv 行为，且是本仓文档写明的顺序）。
+这台机器的 profile 为别的项目导出了另一对 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`，
+于是 core 一直在拿错账号打 Workers AI，`probe()` 回 `unauthorized`，
+而同一份 `.env` 的值用 `curl` 打过去是 200。
+**顺序不改**（改了会让「进程环境优先」这条约定在别处失效），但**不再沉默**：
+core 启动时按变量名 warn，且只在两边的值**真的不同**时才 warn。
+这一条值得记下来的原因是：它长得和「token 失效了」一模一样，
+而设置界面里那套 fingerprint 对比正是为这类事故存在的 —— 只不过它比的是 `.env`，
+比不到 shell 环境。
+
+**2. [P2] 探测失败后，上一次成功的 `quota` 还留在那一行上。**
+`TextRouter.probe()` 把新结果 spread 到旧 health 上，`quota` 没有被覆盖，
+于是用户刚删掉 token、行变成 `unconfigured`，界面上仍然显示「今天用了 161 neurons」。
+改成**整行重建，不再 merge**：探测没说的字段就是没有。
+`missing` 同理；`chat()` 失败时若状态是 `unconfigured` / `unauthorized` 也清掉 `quota`。
+
+**3. [P2] 凭据修好之后，provider 还被冷却挡着。**
+`unauthorized` / `model_missing` 是粘性失败，一次就降级 60s（且翻倍）。
+用户在设置里换上一把能用的 token 之后，如果这一步没有紧跟一次探测，
+路由还会继续走兜底最多 15 分钟 —— 而界面会显示「可用」。
+新增 `TextRouter.resetDemotions()`，凭据一变就调用。只清冷却，不动 `status`
+（`status` 是最后一次**实际观测**到的事实）。
+
+**4. [P3] `--no-realtime` 的语音行说「看 core 的日志」。**
+那是个刻意的开关，不是故障。改成单独报这一种情况。
+
+### 凭据方案最终是哪个：**socket 索取，不是 spawn 时注环境变量**
+
+按 protocol.md §8.3 定的方案落地，没有改。理由那里写了三条，
+实施过程中第二条（「密钥不进环境」）反而变得更重要了：
+本轮排掉的第 1 个问题正是「环境变量里的凭据在你不知情时生效」的另一个面。
+
+### 实测过的（真跑，不是编译过）
+
+- **Cloudflare Workers AI**：装配好的 core + 假 app 走真 socket，
+  用仓库 `.env` 里的账号探测 `@cf/qwen/qwen3.8-27b` → `ok`，1157ms，
+  GraphQL 读回当日真实用量（当天 162 neurons）。
+- **写错模型 id**：故意把 `CF_AI_CHAT_MODEL` 指向 `@cf/qwen/does-not-exist`
+  → 线上回 **HTTP 400 + CF 错误码 7000**（不是 404）→ 映射成 `model_missing`。
+  cf-provider 那份报告里「只按 404 判会错分」的结论，现在对着线上确认了。
+- **设置消息往返**：`settings.get` / `settings.set`（含未知 provider 回
+  `bad_payload` 且**状态没变**）/ `settings.probe`（`timeoutMs:0` 被拒）/
+  `settings.probeResult`（`replyTo` 配对）。
+- **凭据往返**：连上就 `credentials.request` 四个槽 → `credentials.provide` →
+  钥匙串值压过 `.env`（`source:"app"`）、`cleared` 抑制回退、`denied` 回退但单独标记。
+  `settings.state` 与 core 日志里**没有出现任何凭据值**，只有 8 位 fingerprint。
+- **跨语言 payload**：从运行中的 core 抓了四帧原文（`ts`、字段顺序、`active:null`、
+  真实 quota 块、四种凭据状态齐全），用 app 真正的 `Codable` 类型解。
+  这是 Swift↔Swift 往返测不到的那一半 —— 第一版手抄的固件就漏了 `ts`，当场红。
+
+### 没实测的，明说
+
+- **本地 MLX 这一档不能生成。** 权重只有 5 个分片里的第 5 个（1.3 GiB / 21.2 GiB），
+  下载没在跑。`probe()` 正确地报 `model_missing` 并给出百分比 —— 这一条是实测的；
+  但**加载、空闲卸载、视觉塔、以及「降级之后本地真的答出来」全部未验证**。
+- **降级的「换人」那一半只有 mock 覆盖。** 线上确认的是前半段：CF 真的失败、
+  真的被降级、`active` 真的变。后半段没有能应答的兜底可换。
+- **语音这一路本轮没有对着 DashScope 跑过。** `setApiKey` 的续会话是对着
+  `FakeRealtime` 测的；`classifyVoiceFailure` 对 401/403/429 的判定是**对字符串做模式匹配**，
+  只有超时那一支来自真实行为，其余是拿字符串喂给函数测的。
+- **设置窗口没有人点过。** 只有离屏渲染 + 假 app 驱动。
+- **`TextRouter.chat()` 没有调用方。** 文本 / 看截图这一路建好了、能选、能探测、
+  凭据也通到了，但会用它的东西（看屏幕的工具、或一个文字输入口）还不存在。
+  说「文本推理接通了」是指这条链路通了，不是指现在能跟她打字聊天。
+
+### 验证
+
+`make check`：swift build 零警告 / **swift test 146 passed** / typecheck 干净 /
+**bun test 335 pass 0 fail**（接线前是 140 / 288）。
+
+---
+
+## RISK-4 关闭 · 本地模型实测（2026-08-19）
+
+在目标机器（M4 Max / 64 GB / macOS 26.6.1）上实测
+`orcarouter/Qwen3.8-27B-Uncensored-MLX` 6-bit：
+
+| 项 | 实测值 |
+| --- | --- |
+| 磁盘占用 | 22.80 GB（16 个文件，大小与 HF 声明逐一核对一致） |
+| **加载耗时** | **5.41s** |
+| GPU 常驻（加载后） | 22.78 GB |
+| GPU 峰值（推理中） | 26.08 GB |
+| 生成速度 | **25.3 tok/s** |
+| 稳态单轮平均 | 1.66s |
+| **短回答（3 token）** | **0.30s** |
+| 长回答（84 token） | 4.23s |
+
+运行时：`mlx-vlm 0.6.15`（**不是 mlx-lm**）。
+该模型是 `Qwen3_5ForConditionalGeneration`，带 `vision_config` / `image_token_id` /
+`video_token_id`，是真·多模态，`mlx-lm` 加载不了。`mlx_vlm` 的支持列表里有 `qwen3_5`。
+
+### 一个推翻了原设计假设的数字
+
+原本假设「22.8 GB 模型加载很慢，必须懒加载 + 常驻」，据此要求本地 Provider
+设计预热机制并暴露加载进度。**实测加载只要 5.41 秒，这个假设不成立。**
+
+因此本地 Provider 应改为**按需加载 + 闲置卸载**：
+- 切到本地时加载（用户等约 5 秒，可接受）
+- 闲置若干分钟后卸载，把 22.8 GB 交还系统
+- 不需要"加载进度条"这种 UI，一个转圈就够
+
+这比常驻 22.8 GB 好得多 —— 尤其本地路径的定位是**兜底**（断网 / 额度耗尽 / 隐私模式），
+常态下不该占着四分之一的内存。
+
+### 与调研估算的对照
+
+`docs/spec.md` 引用的调研值是「全本地栈端到端 1.5–2.5s」。
+稳态平均 1.66s 落在区间内，但**短回答 0.30s 比估算好一个数量级**，
+而日常对话中短回答占多数。结论：本地兜底的体验比原先预期的可用得多。
+
+**仍未验证**：图像输入（看屏幕截图）的实际延迟与质量；
+本地 LLM 推理与 60fps 形象渲染并发时的相互拖慢（spec §十 的待验证项 5）。
