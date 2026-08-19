@@ -100,3 +100,44 @@ assets/
 
 素材体积可观（1080p HEVC-alpha 每段数 MB），已在 `.gitignore` 中排除 `*.mov` / `*.mp4`，
 不入库，按需分发。
+
+---
+
+## 四、运动幅度与速度的调校
+
+用户反馈「头发飘动幅度太大、频率太快，要微微拂动，也要慢一点」时，
+量化对比揭示了一件事：**这是两个独立的问题，需要两个不同的手段**。
+
+测量方法：按 8fps 抽帧，取人物右侧头发区域，计算相邻帧的平均像素变化。
+
+| 版本 | 平均帧间变化 | 峰值 |
+| --- | --- | --- |
+| 原版（`gentle steady breeze`） | 0.71 | 1.45 |
+| 改提示词为「几乎静止的空气」 | 0.52 (73%) | **0.96 (66%)** |
+| 原版后期放慢 1.5× | **0.49 (69%)** | 1.38 (95%) |
+| **两者叠加（采用）** | **0.35 (49%)** | **0.68 (47%)** |
+
+**结论**：
+- **提示词砍的是「幅度」** —— 峰值从 1.45 降到 0.96，大摆动被消除
+- **后期放慢砍的是「速度」** —— 平均值降了，但峰值几乎不变（放慢不改变摆动幅度）
+
+两者解决的不是同一件事，所以要叠加：先用「几乎静止」的提示词生成，再用
+[`tools/retime`](../tools/retime) 放慢 1.4×。
+
+### 生效的提示词写法
+
+不要写 `gentle` / `subtle` 这类形容词，模型对它们不敏感。要写**具体的物理约束**：
+
+> The air around her is almost completely still. Only the very faintest, slowest
+> drift of air reaches her — just two or three fine strands near her cheek stir
+> gently and settle again over several seconds, barely perceptible. The bulk of
+> her hair stays essentially at rest throughout; it does not sweep, flutter,
+> billow or lift.
+
+关键是三点：给出**数量**（两三缕而非整头发）、给出**时间尺度**（数秒才完成一次）、
+**逐一否定**不想要的运动（sweep / flutter / billow / lift）。
+
+### 采用的最终参数
+
+`listening` 状态：6s 生成 → retime 1.4× → **8.37s / 30fps**，
+再经 `tools/matte` 抠像为 HEVC-with-alpha。
