@@ -94,6 +94,18 @@ struct CoreProcessSpawnGateTests {
         #expect(CoreProcess.probeSocket(at: path) == .absent)
     }
 
+    @Test("a broken path is not mistaken for an absent core")
+    func probeRefusesANonDirectoryInThePath() throws {
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: "akari")
+        try Data().write(to: file)
+        // Nothing can bind under a regular file, so this is not "no core yet".
+        let probe = CoreProcess.probeSocket(at: file.appending(path: "core.sock").path(percentEncoded: false))
+        #expect(probe == .unusable(ENOTDIR))
+        #expect(!CoreProcess.shouldSpawn(probe: probe, appIsConnected: false))
+    }
+
     @Test("a path longer than sun_path is refused rather than truncated")
     func probeRefusesAnOverlongPath() {
         let path = "/tmp/" + String(repeating: "a", count: 200) + "/core.sock"

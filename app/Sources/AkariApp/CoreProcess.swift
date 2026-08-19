@@ -65,11 +65,10 @@ final class CoreProcess {
 
     /// Start a core only once the socket itself says nobody is serving it.
     ///
-    /// Call this *before* the bridge dials. The first look happens synchronously
-    /// for that reason: if a core is already serving, we must not have a probe
-    /// connection open at the same moment as the real one, because the core
-    /// admits exactly one client and answers the second with `already_connected`
-    /// (protocol.md §一) — which would cost the app a full reconnect backoff.
+    /// Call this *before* the bridge dials, and note that the first look happens
+    /// synchronously for that reason: the core admits one client at a time
+    /// (protocol.md §一), so the app asks from the one state where it provably
+    /// holds no connection of its own to be confused with.
     ///
     /// `grace` is not a guess about the handshake. It only covers a core that is
     /// *mid-boot* (bun's cold start), and it is spent re-asking the socket, not
@@ -99,9 +98,13 @@ final class CoreProcess {
             var last = SocketProbe.absent
             while !Task.isCancelled {
                 guard let self, self.process == nil else { return }
-                last = Self.probeSocket(at: socketPath)
+                // A probe costs the core a connection it writes to its audit
+                // log, so skip it when the answer is already known: our own
+                // connection *is* proof that somebody is serving.
+                let connected = isConnected()
+                last = connected ? .serving : Self.probeSocket(at: socketPath)
                 guard Self.decide(probe: last,
-                                  appIsConnected: isConnected(),
+                                  appIsConnected: connected,
                                   socketPath: socketPath) else { return }
                 if ContinuousClock.now >= deadline { break }
                 try? await Task.sleep(for: interval)
@@ -223,7 +226,10 @@ final class CoreProcess {
         close(fd)
         if outcome == 0 { return .serving }
         switch code {
-        case ENOENT, ENOTDIR: return .absent
+        // ENOENT is the ordinary "no core yet". ENOTDIR is not: a non-directory
+        // in the path is structurally broken, and a core cannot bind there
+        // either, so it falls through to `unusable`.
+        case ENOENT: return .absent
         case ECONNREFUSED: return .stale
         case EAGAIN, EINPROGRESS: return .serving
         default: return .unusable(code)
