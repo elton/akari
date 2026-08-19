@@ -1,0 +1,57 @@
+{
+  "clips" : [
+    {
+      "boxHeight" : 889,
+      "boxWidth" : 547,
+      "boxX" : 188,
+      "boxY" : 164,
+      "canvasHeight" : 1080,
+      "canvasWidth" : 810,
+      "duration" : 8.367,
+      "file" : "greeting.mov",
+      "fps" : 30,
+      "frameCount" : 251,
+      "name" : "greeting"
+    },
+    {
+      "boxHeight" : 927,
+      "boxWidth" : 617,
+      "boxX" : 124,
+      "boxY" : 152,
+      "canvasHeight" : 1080,
+      "canvasWidth" : 810,
+      "duration" : 8.367,
+      "file" : "idle.mov",
+      "fps" : 30,
+      "frameCount" : 251,
+      "name" : "idle"
+    },
+    {
+      "boxHeight" : 649,
+      "boxWidth" : 627,
+      "boxX" : 128,
+      "boxY" : 156,
+      "canvasHeight" : 1080,
+      "canvasWidth" : 810,
+      "duration" : 8.367,
+      "file" : "listening.mov",
+      "fps" : 30,
+      "frameCount" : 251,
+      "name" : "listening"
+    },
+    {
+      "boxHeight" : 819,
+      "boxWidth" : 569,
+      "boxX" : 142,
+      "boxY" : 164,
+      "canvasHeight" : 1080,
+      "canvasWidth" : 810,
+      "duration" : 8.367,
+      "file" : "thinking.mov",
+      "fps" : 30,
+      "frameCount" : 251,
+      "name" : "thinking"
+    }
+  ],
+  "version" : 1
+}
