@@ -5,6 +5,14 @@
  * (this file and app/Sources/AkariApp/Protocol.swift) in the same commit.
  */
 
+import type {
+  CredentialSlot,
+  CredentialSource,
+  ProviderCapabilities,
+  ProviderStatus,
+  QuotaSnapshot,
+} from "./providers/types.ts";
+
 /** Bumped on any breaking change to the frame layout or message set. */
 export const PROTOCOL_VERSION = 1;
 
@@ -204,6 +212,132 @@ export interface LogPayload {
   message: string;
 }
 
+
+// ---------------------------------------------------------------------------
+// Settings and credentials (ADR-009, docs/protocol.md §3.9 / §3.10)
+// ---------------------------------------------------------------------------
+
+/**
+ * The independently switchable inference paths.
+ *
+ * There are two, not three. ADR-009's table has three rows, but the third
+ * ("兜底") is not a path the user picks — it is what the `text` route falls
+ * through to. Modelling it as a route would give the settings window a switch
+ * with no meaning when the first two disagree.
+ */
+export const SETTINGS_ROUTES = ["voice", "text"] as const;
+export type SettingsRoute = (typeof SETTINGS_ROUTES)[number];
+
+/**
+ * `selected` value meaning "core decides": use the first candidate that is
+ * healthy, in `candidates` order. Any other value is a provider id.
+ */
+export const AUTO_PROVIDER = "auto";
+
+/** Health of one provider on one route, as the settings window renders it. */
+export interface ProviderHealth {
+  /** `"dashscope-realtime"` | `"cloudflare-workers-ai"` | `"local-mlx"`. */
+  provider: string;
+  status: ProviderStatus;
+  /** One line for the user. Chinese. **Never a credential.** */
+  message?: string;
+  /** Credential slots that are empty; set when `status === "unconfigured"`. */
+  missing?: CredentialSlot[];
+  /** Model id this row is about, e.g. `"@cf/qwen/qwen3.8-27b"`. */
+  model?: string;
+  capabilities?: ProviderCapabilities;
+  quota?: QuotaSnapshot;
+  /** Round trip of the last probe. */
+  latencyMs?: number;
+  /** Unix epoch ms of the last probe; 0 when never probed. */
+  checkedAt: number;
+}
+
+export interface RouteState {
+  route: SettingsRoute;
+  /** What the user picked: a provider id, or `AUTO_PROVIDER`. */
+  selected: string;
+  /** What is serving right now; null when nothing on this route works. */
+  active: string | null;
+  /** Every provider that could serve this route, in fallback order. */
+  candidates: ProviderHealth[];
+}
+
+/** One credential slot, without the credential. */
+export interface CredentialSlotState {
+  slot: CredentialSlot;
+  source: CredentialSource;
+  present: boolean;
+  /** First 8 hex of SHA-256 of the value. Lets both sides compare without
+   *  sending anything. Absent when the slot is unset. */
+  fingerprint?: string;
+  /** The user cleared it in settings; the `.env` fallback is suppressed. */
+  cleared?: boolean;
+  /** The app could not read the Keychain (locked, or access denied). */
+  denied?: boolean;
+  /** Variable the `env` fallback reads, so the UI can name it. */
+  envVar: string;
+}
+
+export interface SettingsStatePayload {
+  routes: RouteState[];
+  credentials: CredentialSlotState[];
+  /** Where the core looked for a `.env`, in the order it looked. */
+  envFiles: { path: string; loaded: boolean }[];
+}
+
+export interface SettingsSetPayload {
+  route: SettingsRoute;
+  /** A provider id, or `AUTO_PROVIDER`. */
+  provider: string;
+}
+
+export interface SettingsProbePayload {
+  route: SettingsRoute;
+  /** Omit to probe every candidate on the route. */
+  provider?: string;
+  /** Give up after this long. Core default 10000; 0 is not allowed. */
+  timeoutMs?: number;
+}
+
+export interface SettingsProbeResultPayload {
+  route: SettingsRoute;
+  results: ProviderHealth[];
+}
+
+/**
+ * The app changed what the Keychain holds. Carries slot ids only — the values
+ * follow, and only because the core asks for them.
+ */
+export interface CredentialsUpdatedPayload {
+  slots: CredentialSlot[];
+}
+
+export interface CredentialsRequestPayload {
+  requestId: string;
+  slots: CredentialSlot[];
+}
+
+/** What the app found in the Keychain for one slot. */
+export interface CredentialValue {
+  slot: CredentialSlot;
+  /**
+   * `set`     — `value` is present.
+   * `cleared` — the user deleted it here; suppresses the `.env` fallback.
+   * `unset`   — never configured here; the `.env` fallback applies.
+   * `denied`  — the Keychain would not answer; falls back like `unset`.
+   */
+  state: "set" | "cleared" | "unset" | "denied";
+  /** Present only when `state === "set"`. **Never logged, on either side.** */
+  value?: string;
+}
+
+export interface CredentialsProvidePayload {
+  requestId: string;
+  /** Answers only the slots the request named. */
+  values: CredentialValue[];
+}
+
 /** Discriminated union of every control message body. */
 export type ControlBody =
   | { type: "app.hello"; payload: AppHelloPayload }
@@ -222,6 +356,14 @@ export type ControlBody =
   | { type: "clipboard.read.request"; payload: ClipboardReadRequestPayload }
   | { type: "clipboard.read.response"; payload: ClipboardReadResponsePayload }
   | { type: "ui.notice"; payload: UiNoticePayload }
+  | { type: "settings.get" }
+  | { type: "settings.state"; payload: SettingsStatePayload }
+  | { type: "settings.set"; payload: SettingsSetPayload }
+  | { type: "settings.probe"; payload: SettingsProbePayload }
+  | { type: "settings.probeResult"; payload: SettingsProbeResultPayload }
+  | { type: "credentials.updated"; payload: CredentialsUpdatedPayload }
+  | { type: "credentials.request"; payload: CredentialsRequestPayload }
+  | { type: "credentials.provide"; payload: CredentialsProvidePayload }
   | { type: "app.quit" }
   | { type: "ping" }
   | { type: "pong" }
@@ -258,6 +400,14 @@ export const MESSAGE_TYPES = [
   "clipboard.read.request",
   "clipboard.read.response",
   "ui.notice",
+  "settings.get",
+  "settings.state",
+  "settings.set",
+  "settings.probe",
+  "settings.probeResult",
+  "credentials.updated",
+  "credentials.request",
+  "credentials.provide",
   "app.quit",
   "ping",
   "pong",

@@ -20,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotkey = PushToTalkHotkey()
     private let prompts = ToolPromptPresenter()
     private let core = CoreProcess()
+    private let settings = SettingsStore()
+    private lazy var settingsWindow = SettingsWindowController(store: settings)
 
     /// One player per display: a `CALayer` has a single superlayer, so the two
     /// 5K panels cannot share one.
@@ -46,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.setCoreStatus("core: 未连接")
 
         wireWindows()
+        wireSettings()
         wireMenu()
         wireHotkey()
         wireAudio()
@@ -53,6 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         windows.start()
         requestMicrophoneAccessAtLaunch()
+        // Deferred one runloop turn past `applicationDidFinishLaunching`.
+        // Ordering a window to the front from inside launch does not survive:
+        // measured on macOS 26, the settings window and its onboarding sheet
+        // came up behind the app that was frontmost even with
+        // `orderFrontRegardless()`, because the launch itself reorders after
+        // this method returns. Running it after that is what makes it stick.
+        Task { @MainActor in self.presentFirstRunOnboardingIfNeeded() }
 
         // Before `bridge.connect()`, not after: the first look is a real
         // `connect(2)` on the core's socket, and the core admits one client at a
@@ -130,12 +140,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if visible { window.show() } else { window.orderOut(nil) }
             }
         }
-        menu.onOpenSettings = {
-            // No settings surface yet; the .env file is the configuration.
-            NSWorkspace.shared.open(Self.repoRoot())
+        menu.onOpenSettings = { [weak self] in
+            self?.settingsWindow.show()
         }
         menu.onTalkPressed = { [weak self] in self?.beginTurn(source: .menu) }
         menu.onTalkReleased = { [weak self] in self?.endTurn(source: .menu) }
+    }
+
+    private func wireSettings() {
+        settings.send = { [weak self] message in
+            try? self?.bridge.send(message)
+        }
     }
 
     private func wireHotkey() {
@@ -196,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.setCoreStatus("core: 连接中…")
         case .ready:
             menu.setCoreStatus("core: 已连接")
+            settings.coreConnected()
             if let formats = bridge.negotiatedFormats {
                 do {
                     try audio.configure(uplink: formats.uplink, downlink: formats.downlink)
@@ -211,6 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             endedStreams.removeAll()
             drainedStreams.removeAll()
             prompts.dismissAll()
+            settings.coreDisconnected()
             // The only moment the app decides an avatar state for itself.
             applyAvatarState(.idle, transitionMs: nil)
         }
@@ -280,6 +297,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? bridge.send(ControlMessage(body: .clipboardReadResponse(answer),
                                             replyTo: message.id))
 
+        case .settingsState, .settingsProbeResult:
+            settings.handle(message)
+
+        case .credentialsRequest(let payload):
+            // The one frame that carries a secret (protocol.md §3.10). It goes
+            // out on this connection and no other: `bridge` only ever dials the
+            // socket `SocketTrust` approved, which is rule 3 of that section.
+            // Nothing here logs the answer — the payload types print themselves
+            // without the values, and this line does not print them either.
+            let answer = settings.answer(payload)
+            try? bridge.send(ControlMessage(body: .credentialsProvide(answer),
+                                            replyTo: message.id))
+
         case .uiNotice(let payload):
             menu.showNotice(payload.text)
             appLog.log(level: payload.level.osLogType,
@@ -341,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Push to talk
+    // MARK: - Microphone
 
     /// Settle the microphone TCC permission at launch, per spec.md §4.5 ("首启只要
     /// 麦克风"). The point is not just when the prompt appears: it is that nothing on
@@ -365,6 +395,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                        "microphone access \(granted ? "granted" : "denied", privacy: .public)")
         }
     }
+
+    // MARK: - First run
+
+    /// ADR-009 accepted "the user configures two sets of credentials" on exactly
+    /// one condition, and this is it: 「首启引导需要把这件事讲清楚，不能让用户以为
+    /// 配一个就能用」.
+    ///
+    /// Without it a user with nothing configured is told nothing. The only
+    /// feedback that exists is a `ui.notice` for the missing DashScope key, and
+    /// `MenuBarController.showNotice` writes that into a menu item and paints the
+    /// connection status back over it five seconds later — invisible unless the
+    /// menu happens to be open at that moment. The Cloudflare half produces no
+    /// notice at all, so the text route can be dead with nothing on screen
+    /// anywhere saying why.
+    ///
+    /// This runs after the microphone prompt is asked for, not before: TCC's
+    /// alert is the one thing that must not queue behind a window of ours.
+    private func presentFirstRunOnboardingIfNeeded() {
+        guard FirstRunOnboarding.shouldPresent(defaults: .standard, rows: settings.rows) else {
+            return
+        }
+        appLog.info("first run: no credentials in the keychain, opening settings")
+
+        // The explanation goes *inside* the window, and the window is raised
+        // above every other application until the user dismisses it.
+        //
+        // Both halves were forced by measurement on a real first launch:
+        //
+        // - An `LSUIElement` app does not get activation it did not earn by
+        //   being clicked on. Neither `NSApp.activate()`, nor
+        //   `orderFrontRegardless()`, nor promoting to `.regular` with
+        //   `setActivationPolicy`, nor any of them a runloop turn later, put
+        //   this window in front of the browser that happened to be frontmost.
+        //   All were tried; all left it buried while the "already shown"
+        //   preference was spent anyway, so the user was never going to see the
+        //   explanation on this launch or any other. A raised window level is
+        //   the one thing the window server honours from a background app.
+        // - The explanation is therefore a banner in the window rather than the
+        //   `NSAlert` sheet this started as. Nothing has to be reconciled with
+        //   the raised window level, and it reads better anyway: it sits above
+        //   the very fields it is telling the user to fill in, instead of
+        //   covering them.
+        settings.onOnboardingDismissed = { [weak self] in
+            self?.settingsWindow.window?.level = .normal
+            FirstRunOnboarding.markPresented(defaults: .standard)
+            appLog.info("first run: onboarding dismissed")
+        }
+        settings.presentOnboarding(FirstRunOnboarding.text)
+        let window = settingsWindow.prepareWindow()
+        window.level = .floating
+        settingsWindow.show()
+        // Recorded on dismissal, not here. Recording it first was the safer
+        // looking order — it cannot loop — but it is what made the failure above
+        // permanent: nobody saw the explanation and the flag said it had been
+        // given. Dismissal is the only evidence it reached anyone, and a launch
+        // that explains itself twice is much the cheaper of the two failures.
+    }
+
+    // MARK: - Push to talk
 
     private func beginTurn(source: PttSource) {
         guard bridge.state == .ready else {
@@ -519,4 +608,74 @@ private extension LogLevel {
         case .error: .error
         }
     }
+}
+
+/// The first-run explanation, as the settings window renders it.
+struct FirstRunOnboardingText: Equatable {
+    let title: String
+    let body: String
+    let dismissTitle: String
+}
+
+/// Whether this launch is the one that has to explain the two-credential split.
+///
+/// A separate type so the decision is testable without a window, a Keychain or a
+/// launch — the AppDelegate keeps only the part that puts it on screen.
+enum FirstRunOnboarding {
+    /// An explicit preference, deliberately **not** "does a `.env` exist".
+    /// Every development checkout has one, so that test would silence the
+    /// onboarding precisely on the machines where it is being written, and leave
+    /// it unexercised until a real user hit it.
+    static let defaultsKey = "akari.onboardingShown"
+
+    static func shouldPresent(defaults: UserDefaults, rows: [CredentialRow]) -> Bool {
+        if defaults.bool(forKey: defaultsKey) { return false }
+        return !hasAnyStoredCredential(rows)
+    }
+
+    static func markPresented(defaults: UserDefaults) {
+        defaults.set(true, forKey: defaultsKey)
+    }
+
+    /// Only what the app can see in its own Keychain counts.
+    ///
+    /// `.denied` counts as "configured" even though no value came back: a
+    /// Keychain that would not open is *cannot tell*, not *nothing there*, and
+    /// interrupting someone whose Keychain is merely locked is worse than
+    /// staying quiet — the settings window is one menu click away either way.
+    ///
+    /// A `.env` deliberately does not count. The core reads it and the settings
+    /// window offers to import from it, but it belongs to whoever built the
+    /// checkout, not to the person launching the app.
+    static func hasAnyStoredCredential(_ rows: [CredentialRow]) -> Bool {
+        rows.contains { row in
+            switch row.stored {
+            case .set, .denied: true
+            case .unset, .cleared: false
+            }
+        }
+    }
+
+    static var text: FirstRunOnboardingText {
+        FirstRunOnboardingText(title: title, body: explanation, dismissTitle: "知道了，去填")
+    }
+
+    static let title = "akari 要两套凭据，各管一半"
+
+    /// Says the thing ADR-009 promised would be said: one is not enough, and
+    /// which half stops working without which key.
+    static let explanation = """
+        语音和文本走的是两个不同的服务，配好一个不代表另一个能用 —— 得各配各的。
+
+        · 语音对话 —— 阿里云百炼 DashScope 的 API Key。
+          没有它，说话不会有回应。（选它是因为只有它把 VAD 和打断放在服务端做，实测首个音频包 473ms。）
+
+        · 文本与看截图 —— 你自己的 Cloudflare 账号 ID 和 API Token，
+          token 必须给 Workers AI「编辑」权限：只给「读取」时能列出模型、跑推理会 403。
+          用你自己的账号，是为了不把作者的凭据打包进应用里。
+
+        · 本地模型是断网或额度用尽时的兜底，要先下 22.8 GB 权重，可以以后再说。
+
+        每一组下面都有「保存并测试」，填完当场就知道通不通。
+        """
 }

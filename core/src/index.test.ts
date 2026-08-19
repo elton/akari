@@ -267,3 +267,161 @@ describe("core assembly", () => {
     await app.expect("pong");
   });
 });
+
+/**
+ * The settings and credential wiring, driven through the real core over the
+ * real socket (ADR-009). No network: Cloudflare is left unconfigured and the
+ * local runtime is told not to autostart, so every probe below is answered
+ * from the core's own state rather than from a service.
+ */
+describe("settings and credentials over the wire", () => {
+  /** Blank strings shadow the repo `.env`, which would otherwise supply real keys. */
+  const NO_CREDENTIALS = {
+    DASHSCOPE_API_KEY: "",
+    CLOUDFLARE_ACCOUNT_ID: "",
+    CLOUDFLARE_API_TOKEN: "",
+    HF_TOKEN: "",
+    LOCAL_MLX_AUTOSTART: "0",
+  };
+
+  function state(app: StandInApp): Record<string, any> | undefined {
+    return app.payloads("settings.state").at(-1);
+  }
+
+  function route(app: StandInApp, id: string): Record<string, any> {
+    return (state(app)!["routes"] as any[]).find((r) => r.route === id);
+  }
+
+  test("the core asks for every slot as soon as the handshake is done", async () => {
+    const core = await startCore(["--no-realtime"], NO_CREDENTIALS);
+    const app = await attach(core);
+
+    const request = await app.expect("credentials.request");
+    const requestPayload = (request as any).payload;
+    expect(requestPayload.slots).toEqual([
+      "dashscope.apiKey",
+      "cloudflare.accountId",
+      "cloudflare.apiToken",
+      "huggingface.token",
+    ]);
+    expect(typeof requestPayload.requestId).toBe("string");
+  });
+
+  test("a Keychain value wins over .env, and the state says so without the value", async () => {
+    const core = await startCore(["--no-realtime"], {
+      ...NO_CREDENTIALS,
+      CLOUDFLARE_ACCOUNT_ID: "from-the-env-file",
+    });
+    const app = await attach(core);
+    const request = (await app.expect("credentials.request")) as any;
+
+    app.send(
+      {
+        type: "credentials.provide",
+        payload: {
+          requestId: request.payload.requestId,
+          values: [
+            { slot: "cloudflare.accountId", state: "set", value: "from-the-keychain" },
+            { slot: "dashscope.apiKey", state: "cleared" },
+            { slot: "cloudflare.apiToken", state: "unset" },
+            { slot: "huggingface.token", state: "denied" },
+          ],
+        },
+      } as unknown as ControlBody,
+      request.id,
+    );
+    await until(() => app.payloads("settings.state").length > 0, () => "no settings.state");
+    await Bun.sleep(200);
+
+    const credentials = state(app)!["credentials"] as any[];
+    const account = credentials.find((c) => c.slot === "cloudflare.accountId");
+    expect(account.source).toBe("app");
+    expect(account.present).toBe(true);
+    expect(account.fingerprint).toMatch(/^[0-9a-f]{8}$/);
+    // §八: the resolved value never appears in settings.state, only a hash of it.
+    expect(JSON.stringify(state(app))).not.toContain("from-the-keychain");
+
+    expect(credentials.find((c) => c.slot === "dashscope.apiKey").cleared).toBe(true);
+    expect(credentials.find((c) => c.slot === "huggingface.token").denied).toBe(true);
+    // …and no credential reached the log, at any level.
+    expect(core.log()).not.toContain("from-the-keychain");
+    expect(core.log()).not.toContain("from-the-env-file");
+  });
+
+  test("the state lists three providers across two routes", async () => {
+    const core = await startCore(["--no-realtime"], NO_CREDENTIALS);
+    const app = await attach(core);
+    app.send({ type: "settings.get" });
+    await until(() => app.payloads("settings.state").length > 0, () => "no settings.state");
+
+    expect(route(app, "voice").candidates.map((c: any) => c.provider)).toEqual([
+      "dashscope-realtime",
+    ]);
+    // ADR-009's fallback order: the user's own Cloudflare first, local behind it.
+    expect(route(app, "text").candidates.map((c: any) => c.provider)).toEqual([
+      "cloudflare-workers-ai",
+      "local-mlx",
+    ]);
+    expect(route(app, "text").selected).toBe("auto");
+    expect(state(app)!["envFiles"]).toBeArray();
+  });
+
+  test("settings.set pins the text route; an unknown provider changes nothing", async () => {
+    const core = await startCore(["--no-realtime"], NO_CREDENTIALS);
+    const app = await attach(core);
+    app.send({ type: "settings.get" });
+    await until(() => app.payloads("settings.state").length > 0, () => "no settings.state");
+
+    const before = app.payloads("settings.state").length;
+    app.send({ type: "settings.set", payload: { route: "text", provider: "local-mlx" } });
+    await until(
+      () => app.payloads("settings.state").length > before,
+      () => "settings.set was not answered",
+    );
+    expect(route(app, "text").selected).toBe("local-mlx");
+
+    app.send({ type: "settings.set", payload: { route: "text", provider: "openai" } });
+    await app.expect("error");
+    expect(app.payloads("error").at(-1)!["code"]).toBe("bad_payload");
+    // Still pinned to what the user actually chose.
+    expect(route(app, "text").selected).toBe("local-mlx");
+  });
+
+  test("probing an unconfigured route reports what is missing, not a network error", async () => {
+    const core = await startCore(["--no-realtime"], NO_CREDENTIALS);
+    const app = await attach(core);
+
+    app.send({ type: "settings.probe", payload: { route: "text", timeoutMs: 8000 } });
+    await until(
+      () => app.payloads("settings.probeResult").length > 0,
+      () => `no probeResult\n${core.log()}`,
+      20_000,
+    );
+    const results = app.payloads("settings.probeResult").at(-1)!["results"] as any[];
+    const cloudflare = results.find((r) => r.provider === "cloudflare-workers-ai");
+    expect(cloudflare.status).toBe("unconfigured");
+    expect(cloudflare.missing).toEqual(["cloudflare.accountId", "cloudflare.apiToken"]);
+    // The capability block is readable before anything works, which is what
+    // lets the window draw a row for a provider that is not configured yet.
+    expect(cloudflare.capabilities.vision).toBe(true);
+  });
+
+  test("credentials.updated is followed by a request for exactly those slots", async () => {
+    const core = await startCore(["--no-realtime"], NO_CREDENTIALS);
+    const app = await attach(core);
+    await app.expect("credentials.request");
+
+    app.send({
+      type: "credentials.updated",
+      payload: { slots: ["cloudflare.apiToken"] },
+    } as unknown as ControlBody);
+    await until(
+      () => app.seen("credentials.request").length > 1,
+      () => "no second credentials.request",
+    );
+    const second = app.payloads("credentials.request").at(-1)!;
+    expect(second["slots"]).toEqual(["cloudflare.apiToken"]);
+    // The slot names are the loggable half of §3.10.
+    expect(core.log()).toContain("credentials.updated: cloudflare.apiToken");
+  });
+});

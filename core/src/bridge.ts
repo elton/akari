@@ -17,6 +17,7 @@ import {
   FrameReader,
   FrameType,
   PROTOCOL_VERSION,
+  SETTINGS_ROUTES,
   decodeAudioPayload,
   decodeControlPayload,
   encodeAudio,
@@ -29,10 +30,17 @@ import {
   type ConfirmDecision,
   type ControlBody,
   type ControlMessage,
+  type CredentialValue,
   type LogLevel,
+  type SettingsProbePayload,
+  type SettingsProbeResultPayload,
+  type SettingsRoute,
+  type SettingsSetPayload,
+  type SettingsStatePayload,
   type ToolConfirmRequestPayload,
   type ToolUndoablePayload,
 } from "./protocol.ts";
+import { CREDENTIAL_SLOTS, type CredentialSlot } from "./providers/types.ts";
 
 /**
  * Is somebody currently accepting connections on this socket path?
@@ -105,6 +113,27 @@ export interface BridgeHandlers {
   onUndo?: (requestId: string) => void;
   /** User picked Quit from the menu bar. */
   onQuit?: () => void;
+
+  // --- settings (protocol.md §3.9) -----------------------------------------
+  //
+  // These three return the payload to answer with rather than sending it
+  // themselves, so the `replyTo` bookkeeping stays in one place: §3.9 requires
+  // every one of them to be answered on the id of the message that asked.
+
+  /** `settings.get`. */
+  onSettingsGet?: () => SettingsStatePayload;
+  /**
+   * `settings.set`. Return the new snapshot, or `null` when this route has no
+   * such provider — the bridge then answers `error{code:"bad_payload"}` and
+   * **nothing has changed**, which is what §3.9 requires.
+   */
+  onSettingsSet?: (payload: SettingsSetPayload) => SettingsStatePayload | null;
+  /** `settings.probe`. */
+  onSettingsProbe?: (payload: SettingsProbePayload) => Promise<SettingsProbeResultPayload>;
+  /** `credentials.updated`: these slots moved in the app's Keychain. Values do
+   *  not come with it; the core asks for them (§3.10). */
+  onCredentialsUpdated?: (slots: CredentialSlot[]) => void;
+
   /** Any control message, after the typed handlers above. */
   onMessage?: (message: ControlMessage) => void;
   /** Bridge-level diagnostics. Never carries credentials. */
@@ -126,6 +155,9 @@ export interface BridgeOptions {
 
 /** How long the app gets to answer a clipboard read before it counts as failed. */
 const CLIPBOARD_TIMEOUT_MS = 5_000;
+
+/** protocol.md §3.10: 5s, after which the core keeps the values it already has. */
+const CREDENTIAL_TIMEOUT_MS = 5_000;
 
 /** What the app reported for one `clipboard.read` (protocol.md §3.7). */
 export interface ClipboardReadResult {
@@ -191,6 +223,10 @@ export class Bridge {
   #undos = new Map<string, Pending<boolean>>();
   #clipboardReads = new Map<string, Pending<ClipboardOutcome>>();
   #clipboardSeq = 0;
+  /** In-flight `credentials.request`s, by `requestId`. Holds no values: the
+   *  answer is handed straight to the resolver and never kept here. */
+  #credentialRequests = new Map<string, Pending<CredentialValue[] | null>>();
+  #credentialSeq = 0;
   /** Kernel-reported identity of the attached client, for the audit trail. */
   #peer: string | undefined;
 
@@ -296,13 +332,19 @@ export class Bridge {
     }
   }
 
-  async close(): Promise<void> {
+  /**
+   * `unlinkSocket: false` shuts the listener down and leaves the path behind,
+   * which is what a SIGKILLed core leaves on disk. Only the takeover tests want
+   * it — a clean shutdown removes its own socket.
+   */
+  async close(options: { unlinkSocket?: boolean } = {}): Promise<void> {
     this.#closing = true;
     this.#settleAllPending("bridge closing");
     this.#socket?.end();
     this.#socket = null;
     this.#listener?.stop(true);
     this.#listener = null;
+    if (options.unlinkSocket === false) return;
     await unlink(this.#socketPath).catch(() => {});
   }
 
@@ -475,6 +517,54 @@ export class Bridge {
         text: outcome.payload.text ?? null,
         concealed: outcome.payload.concealed,
       };
+    });
+  }
+
+  /**
+   * Push the settings snapshot (protocol.md §3.9).
+   *
+   * Gated on the handshake rather than merely on having a socket: §3.9 says
+   * nothing is pushed before `core.ready`, and an app that has not said hello
+   * yet is not known to speak this version of the protocol.
+   */
+  sendSettingsState(payload: SettingsStatePayload): void {
+    if (!this.#handshakeDone) return;
+    this.#send({ type: "settings.state", payload });
+  }
+
+  /**
+   * Ask the app for the named credential slots (protocol.md §3.10).
+   *
+   * Resolves with the app's answer, or `null` when there is no app or it did
+   * not answer within 5s. `null` means **keep what we already have** — §八 is
+   * explicit that reverting to `.env` behind the user's back would silently
+   * move billing to another account and drop the voice session with it.
+   *
+   * The resolved values are secret. Nothing in this method logs them, and the
+   * only things it does log are the `requestId` and the slot names.
+   */
+  requestCredentials(
+    slots: readonly CredentialSlot[],
+    timeoutMs: number = CREDENTIAL_TIMEOUT_MS,
+  ): Promise<CredentialValue[] | null> {
+    if (slots.length === 0) return Promise.resolve([]);
+    if (!this.connected) return Promise.resolve(null);
+    const requestId = `cr-${++this.#credentialSeq}`;
+    return new Promise<CredentialValue[] | null>((resolve) => {
+      const settle = (values: CredentialValue[] | null) => {
+        const pending = this.#credentialRequests.get(requestId);
+        if (!pending) return;
+        this.#credentialRequests.delete(requestId);
+        if (pending.timer) clearTimeout(pending.timer);
+        resolve(values);
+      };
+      const timer = setTimeout(() => {
+        this.#log("warn", `credentials.request ${requestId} went unanswered; keeping current values`);
+        settle(null);
+      }, timeoutMs);
+      this.#credentialRequests.set(requestId, { resolve: settle, timer });
+      this.#log("info", `credentials.request ${requestId}: ${slots.join(", ")}`);
+      this.#send({ type: "credentials.request", payload: { requestId, slots: [...slots] } });
     });
   }
 
@@ -694,6 +784,84 @@ export class Bridge {
         break;
       }
 
+      case "settings.get": {
+        const state = this.#handlers.onSettingsGet?.();
+        if (state) this.#send({ type: "settings.state", payload: state }, message.id);
+        break;
+      }
+
+      case "settings.set": {
+        const route = this.#route(message);
+        const provider = stringField(message, "provider");
+        if (!route || !provider) {
+          this.#badPayload(message.id, "settings.set: route and provider are required");
+          return;
+        }
+        const state = this.#handlers.onSettingsSet?.({ route, provider });
+        if (!state) {
+          // §3.9: an unknown provider changes nothing and is reported as a
+          // non-fatal bad_payload, not as a silently ignored no-op.
+          this.#badPayload(message.id, `settings.set: ${route} has no provider ${provider}`);
+          return;
+        }
+        this.#send({ type: "settings.state", payload: state }, message.id);
+        break;
+      }
+
+      case "settings.probe": {
+        const route = this.#route(message);
+        if (!route) {
+          this.#badPayload(message.id, "settings.probe: unknown route");
+          return;
+        }
+        const timeoutMs = numberField(message, "timeoutMs");
+        // §3.9 forbids 0: a settings button that spins forever is not a state
+        // the user can act on.
+        if (timeoutMs !== null && !(timeoutMs > 0)) {
+          this.#badPayload(message.id, "settings.probe: timeoutMs must be greater than 0");
+          return;
+        }
+        const provider = stringField(message, "provider");
+        const request: SettingsProbePayload = {
+          route,
+          ...(provider ? { provider } : {}),
+          ...(timeoutMs !== null ? { timeoutMs } : {}),
+        };
+        const replyTo = message.id;
+        void Promise.resolve(this.#handlers.onSettingsProbe?.(request))
+          .then((result) => {
+            if (result) this.#send({ type: "settings.probeResult", payload: result }, replyTo);
+          })
+          .catch((error) => {
+            this.#log("warn", `settings.probe failed: ${(error as Error).message}`);
+            this.#send({ type: "settings.probeResult", payload: { route, results: [] } }, replyTo);
+          });
+        break;
+      }
+
+      case "credentials.updated": {
+        // Slot names only, by design — this one may be logged in full.
+        const slots = this.#slots(message);
+        this.#log("info", `credentials.updated: ${slots.join(", ") || "(nothing known)"}`);
+        this.#handlers.onCredentialsUpdated?.(slots);
+        break;
+      }
+
+      case "credentials.provide": {
+        const requestId = stringField(message, "requestId");
+        if (!requestId) {
+          this.#badPayload(message.id, "credentials.provide: requestId missing");
+          return;
+        }
+        // The one frame in the protocol that carries a secret (§3.10 rule 1):
+        // nothing below logs it, and the parsed values go straight to whoever
+        // is awaiting the request.
+        this.#credentialRequests.get(requestId)?.resolve(parseCredentialValues(message));
+        // Returns rather than breaks: `onMessage` is a general-purpose sink and
+        // this is the one message that must not reach one (§3.10 rule 4).
+        return;
+      }
+
       case "app.quit":
         this.#handlers.onQuit?.();
         break;
@@ -794,6 +962,20 @@ export class Bridge {
     }
   }
 
+  /** The `route` field, or `undefined` when it is not one this core has. */
+  #route(message: ControlMessage): SettingsRoute | undefined {
+    const value = stringField(message, "route");
+    return (SETTINGS_ROUTES as readonly string[]).includes(value)
+      ? (value as SettingsRoute)
+      : undefined;
+  }
+
+  /** The `slots` field of `credentials.updated`, unknown names dropped. */
+  #slots(message: ControlMessage): CredentialSlot[] {
+    const raw = payloadOf(message)["slots"];
+    return Array.isArray(raw) ? raw.filter(isCredentialSlot) : [];
+  }
+
   #settleAllPending(reason: string): void {
     for (const [, pending] of this.#confirms) {
       if (pending.timer) clearTimeout(pending.timer);
@@ -812,6 +994,14 @@ export class Bridge {
       pending.resolve({ ok: false, reason });
     }
     this.#clipboardReads.clear();
+    for (const [, pending] of this.#credentialRequests) {
+      if (pending.timer) clearTimeout(pending.timer);
+      // §八 "app 断线": null is "keep what you have". Resolving these as an
+      // empty answer would read as "the app has nothing", which is how a
+      // disconnect would quietly demote a working session back to `.env`.
+      pending.resolve(null);
+    }
+    this.#credentialRequests.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -939,6 +1129,39 @@ function booleanField(message: ControlMessage, key: string): boolean {
 
 function isLogLevel(value: string): value is LogLevel {
   return value === "debug" || value === "info" || value === "warn" || value === "error";
+}
+
+function isCredentialSlot(value: unknown): value is CredentialSlot {
+  return typeof value === "string" && (CREDENTIAL_SLOTS as readonly string[]).includes(value);
+}
+
+/**
+ * Parse `credentials.provide.values` (protocol.md §3.10).
+ *
+ * Unknown slot names are dropped — §3.10 says the core ignores them, and a slot
+ * name is attacker-choosable in exactly the way a Keychain account name is.
+ * A `set` without a string `value` is dropped too rather than being turned into
+ * an empty secret; the app's own type cannot produce one, so seeing it means
+ * the sender is not the app.
+ *
+ * **Nothing here logs, and nothing here throws with a value in the message.**
+ */
+function parseCredentialValues(message: ControlMessage): CredentialValue[] {
+  const raw = payloadOf(message)["values"];
+  if (!Array.isArray(raw)) return [];
+  const values: CredentialValue[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const { slot, state, value } = entry as Record<string, unknown>;
+    if (!isCredentialSlot(slot)) continue;
+    if (state === "set") {
+      if (typeof value !== "string") continue;
+      values.push({ slot, state: "set", value });
+    } else if (state === "cleared" || state === "unset" || state === "denied") {
+      values.push({ slot, state });
+    }
+  }
+  return values;
 }
 
 // ---------------------------------------------------------------------------

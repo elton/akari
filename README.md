@@ -32,7 +32,7 @@ desktop, keeping you company and illuminating whatever you are working on.
 | Avatar | Pre-rendered AI video loops, HEVC-with-alpha | No realtime photoreal avatar runs on Apple Silicon in 2026 |
 | Window | `NSWindow.level = desktopIconWindow - 1` | Sits above wallpaper, below desktop icons. Zero entitlements |
 | Voice | `qwen3.5-omni-flash-realtime` over WebSocket | Measured 473ms to first audio packet; server-side VAD and barge-in |
-| Brain | `qwen3.7-flash` (cloud) / `Qwen3.8-27B-MLX` 6-bit (local) | Provider abstraction, each swappable independently |
+| Brain | Your own Cloudflare Workers AI `@cf/qwen/qwen3.8-27b`, falling back to local `Qwen3.8-27B-MLX` 6-bit | ADR-009: text and screenshots bill to the user's own account; local is the offline/out-of-quota floor |
 | Control | Accessibility API + Shortcuts + shell, four-tier risk gating | GUI agents are ~86% accurate — one misstep every 7 actions |
 | Shell | Swift/AppKit host + TypeScript core over a Unix socket | Business logic stays in TS; Swift is a thin system-glue layer |
 
@@ -103,6 +103,13 @@ the menu bar says so too.
 | Variable | Meaning |
 | --- | --- |
 | `DASHSCOPE_API_KEY` | Required for voice. Read from the repo-root `.env`, then `~/Library/Application Support/akari/.env`; never logged |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | Required for text and screenshots. The token needs Workers AI **Edit** — Read lists models and 403s on inference |
+| `HF_TOKEN` | Only used to pull the local weights; the repo is gated |
+| `CF_AI_CHAT_MODEL` | Overrides `@cf/qwen/qwen3.8-27b` |
+| `LOCAL_MLX_MODEL` / `LOCAL_MLX_WEIGHTS` | Repo id (or an absolute checkpoint path) and where the weights actually are |
+| `LOCAL_MLX_PYTHON` / `LOCAL_MLX_SOCKET` / `LOCAL_MLX_ENDPOINT` | The `mlx_vlm` interpreter, the unix socket it serves on, or somebody else's server to use instead |
+| `LOCAL_MLX_AUTOSTART` | `0` keeps this core from ever spawning a local runtime |
+| `LOCAL_MLX_IDLE_MS` | Unload the local runtime after this long idle, releasing ~22.8 GB. `0` disables |
 | `AKARI_SOCKET` | Unix socket path. Must be under 104 bytes (macOS `sun_path`). The core reads it always; **the app reads it in DEBUG builds only** — see below |
 | `AKARI_ASSETS_DIR` | Where `<state>.mov` lives. Defaults to the bundle, then `<repo>/assets/akari` |
 | `AKARI_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` |
@@ -111,6 +118,33 @@ the menu bar says so too.
 | `AKARI_PEER_ALLOW` | Colon-separated absolute paths that replace the built-in akari.app allow-list |
 | `AKARI_SUPERVISED` | `1` when the app spawned the core; the core then exits if that parent dies |
 | `AKARI_AUDIT_LOG` | Where the tool audit trail is appended. Defaults to `audit.jsonl` beside the socket; created 0600 |
+
+#### Where credentials come from, and which one wins
+
+Two sources, resolved **per slot** (`docs/protocol.md` §八):
+
+```
+the app's Keychain (settings window)  →  process env, which includes .env  →  unset
+```
+
+Per slot rather than per source, so a half-filled Keychain cannot blank out a
+working `.env`; app first, because the settings window is where the user just
+typed. `.env` alone stays a complete configuration — `make run-core` has no app
+to ask, and that path must keep working.
+
+Credentials reach the core **over the socket, not through its environment**
+(`credentials.request` / `credentials.provide`). Two reasons: a key typed into
+the settings window has to take effect without restarting the core, because
+restarting it drops a metered Realtime session; and this repo already forbids
+secrets in child environments (`core/src/tools/builtin/process.ts` whitelists
+nine variables — "one injected `run env` is the whole keyring").
+
+One trap worth knowing, because it cost real time here: **a variable already
+exported in the shell you launch from outranks the `.env` beside the
+checkout.** That is conventional dotenv behaviour and it stays, but the core now
+warns by name at startup when a `.env` line for a credential was ignored *and*
+the two values differ. The symptom otherwise is Cloudflare answering 401 for a
+token that works perfectly in `curl`.
 
 #### Socket trust boundary — where it actually stands
 
@@ -183,7 +217,16 @@ already taken by something else.
 | No second core, no second billed session | App started first, a hand-run core 1.85s later. 12s on, `pgrep -f src/index.ts` showed exactly one process and the app was attached to it |
 | A hand-run core outlives the app | Killing the app left the hand-run core running and its log said `app disconnected`, not `app.quit`. Driven again through the graceful path (a fake core sending `app.quit` to make the app terminate): the current build sends no `app.quit` back; the build with the guard reverted does |
 | Playback ledger under a race | Four producers flooding buffers while a cancel and a stream reopen land from other threads, asserted with no flush to hide the evidence. Green on the fix; the reverted build strands an orphan count on all four streams in round 0, 3 runs out of 3 |
-| Test suite | `make check`: `swift build` (zero warnings) + 80 `swift test` + `tsc --noEmit` + 160 `bun test` |
+| Settings round trip | `settings.get` → `settings.state`; `settings.set` pinning the text route; an unknown provider answered `bad_payload` with the selection **unchanged**; `timeoutMs: 0` refused; `settings.probe` → `settings.probeResult`, paired by `replyTo` |
+| Credentials round trip | `credentials.request` on connect for all four slots → `credentials.provide` → the Keychain value beating `.env` (`source: "app"`), `cleared` suppressing the `.env` fallback, `denied` falling back but still flagged. No credential appeared in `settings.state` or in the core log at any level — only 8-hex fingerprints |
+| Cross-language payloads | Four frames captured verbatim from a running core (`ts`, key order, `active: null`, a real quota block, all four credential states) and decoded by the app's real `Codable` types in `CoreWirePayloadTests` — the half that Swift-to-Swift round trips cannot check |
+| A first launch, on a real screen | `.app` launched with the onboarding preference cleared and another app frontmost, window order read back from `CGWindowListCopyWindowInfo`. The settings window comes up **in front** with the two-credential explanation on it, and the "already shown" flag is written only when the user dismisses it. Every earlier attempt (`NSApp.activate()`, `orderFrontRegardless()`, `setActivationPolicy(.regular)`) left the window buried behind the frontmost app — measured, not assumed |
+| A bad DashScope key, against the live service | A deliberately invalid key through a real handshake: close 1002 `Expected 101 status code` → classified `unauthorized`, and confirmed over HTTP where the status survives. A host that does not resolve still gives 1006 `Failed to connect` → `unreachable`, so the fix did not over-reach |
+| A hung network, not a refused one | A local TCP listener that accepts and then answers nothing — the captive-portal case. The router gave up at **15.00s** and the local model answered, instead of waiting out the ~75s system TCP timeout, and `state.active` said `local-mlx` on that same turn with one `ui.notice` emitted |
+| The local runtime does not outlive the core | The real `.venv-mlx` serving `mlx_vlm.server` over a real socket, `kill -9` on its parent. Reparented to PID 1 within 0.56s and gone by 1.7s; repeated **with the 27B weights actually loaded**, gone within 1s. `pgrep -f mlx_vlm.server` empty both times |
+| Keychain protection, measured not assumed | A probe binary at the app's own signing status: `SecItemAdd` with `kSecUseDataProtectionKeychain` answers **-34018**, and without it the item comes back with attributes `[acct cdat class labl mdat svce]` — **no `pdmn`**. `kSecAttrAccessible` is requested and not enforced, which is what the settings window now says out loud |
+| Cloudflare Workers AI, for real | The assembled core, driven over the socket by a stand-in app, probed `@cf/qwen/qwen3.8-27b` on the repo's own account: `ok` in 1157ms with a real neuron count (162 that day) read back over GraphQL. A deliberately wrong model id came back HTTP **400 + CF code 7000**, not 404, and mapped to `model_missing`. Re-checked after the ADR-009 fix round: probe `ok` 922ms, first chunk 461ms, and function calling still returns `get_weather({"city":"东京"})` |
+| Test suite | `make check`: `swift build` (zero warnings) + 168 `swift test` + `tsc --noEmit` + 379 `bun test` |
 
 ### Compiles and is wired, but not yet exercised
 
@@ -215,10 +258,32 @@ with a stand-in app, which is exactly what cannot prove the app's own UI. See
 - The `codesign` peer tier throws on purpose. Real peer isolation waits on an Apple
   Developer Team ID; until then both socket checks are speed bumps, and the app's
   check of the core does not stop a process running as you (see above).
-- `createProviders()` throws. The local MLX path (ADR-003) is an interface only.
+- **Nothing calls `TextRouter.chat()` yet.** The text/vision path of ADR-009 is
+  built, selectable, probeable and credential-fed end to end — but the only
+  consumer that would use it (a "look at my screen" tool, or a typed-chat entry
+  point) does not exist. Today the route is exercised by the settings screen and
+  by tests, not by a conversation.
+- **The degrade notice has no trigger in this build.** Falling back now emits a
+  `ui.notice` and the core wires it to the menu bar, tested and measured — but
+  since nothing calls `TextRouter.chat()`, no user can currently cause a text
+  turn, so no user will see it. The mechanism is finished; its entry point is
+  not.
+- **`LocalTextProvider.warmup()` and `progress()` have no caller.** `warmup()` is
+  the only call that proves the local model can actually *generate* (`probe()`
+  only checks the shards are on disk at the right sizes), and the settings window
+  has no button for it yet. It was deliberately not folded into `settings.probe`:
+  that button means "check this route", and having it quietly pull 22.8 GB into
+  memory is not a side effect anyone would expect.
+- **The local weights are present and do load**, but the vision tower and the
+  idle unload are still unverified. Loading, generating and the parent watchdog
+  are measured (above); nothing else about local inference is.
 - Only `listening.mov` exists. Every other state falls back to it with a warning.
-- No memory, no persona persistence across restarts, no settings UI — the menu's
-  "设置…" opens the repo folder, because `.env` is the configuration.
+- No memory, no persona persistence across restarts.
+- The settings window's local-model section has no size, load progress or
+  "unload to free memory": `ProviderHealth` carries `status`/`message`/`model`/
+  `capabilities` and nothing else, and inventing buttons for messages the
+  protocol does not have would be worse than the missing feature. It shows the
+  core's probe result and a re-probe button, and says so on screen.
 
 ## Manual checks
 
@@ -230,39 +295,66 @@ Unlock the machine, then:
    should say `AUDIT peer accepted` with the bundle's own binary path — if it says
    `peer refused`, the app and the core disagree about who the app is, and that is a
    bug, not a configuration problem.
-2. macOS should ask for the microphone **at launch**, not on the first ⌥Space —
+2. Menu bar → **设置…** should open a settings window with three provider rows and
+   four credential fields. Paste a Cloudflare account id and token and press
+   **保存并测试**: the button must come back within ~20s with a verdict, the
+   credential line under the field must change to "来自钥匙串", and the core's log
+   must show `credentials.updated` followed by `credentials.request` — with no
+   value in it. Then pull the network and press it again: the row should say
+   连不上 and the text route should show it fell to the local model. **None of
+   this has been done by a human yet**: the window has only been rendered
+   offscreen (`AKARI_RENDER=1 AKARI_RENDER_OUT=/tmp/settings.png swift test`) and
+   driven by a stand-in app, never clicked.
+3. macOS should ask for the microphone **at launch**, not on the first ⌥Space —
    the prompt was moved so that no async step sits on the push-to-talk path.
    Then hold **⌥Space**. Speak, release.
    Expect her to answer out loud, and the menu bar icon to walk through
    waveform → ellipsis → speech bubble → moon.
-3. Watch the avatar: does she appear on both displays, below the desktop icons and
+4. Watch the avatar: does she appear on both displays, below the desktop icons and
    above the wallpaper, with no opaque rectangle around her (that would mean the
    clip lost its alpha channel — re-encode with `tools/matte`).
-4. Drag a window over her, then `log stream --predicate 'subsystem == "me.eltonzheng.akari"'`
+5. Drag a window over her, then `log stream --predicate 'subsystem == "me.eltonzheng.akari"'`
    — the occluded display should stop decoding.
-5. Lock the screen and unlock it. Both windows must survive and resume.
-6. Close the lid / unplug a display and reconnect it. This is the
+6. Lock the screen and unlock it. Both windows must survive and resume.
+7. Close the lid / unplug a display and reconnect it. This is the
    `isReleasedWhenClosed` crash path; 28 stress rounds passed in RISK-2, but not
    with the real app.
-7. `.stationary` retest (RISK-2 left this open): the 98% window scale it caused was
+8. `.stationary` retest (RISK-2 left this open): the 98% window scale it caused was
    measured on a locked machine and has to be re-checked unlocked before the flag
    can be ruled out for good.
-8. Tap ⌥Space and let go immediately. She must go back to sleep, and the menu bar
+9. Tap ⌥Space and let go immediately. She must go back to sleep, and the menu bar
    must say why ("按得太短了…") — not sit on the thinking icon.
-9. Copy a password out of 1Password or Bitwarden, then ask her to read the clipboard.
+10. Copy a password out of 1Password or Bitwarden, then ask her to read the clipboard.
    She must say the content was marked secret and skipped, and must not read it out.
-10. Force-quit akari (Activity Monitor → Force Quit, i.e. SIGKILL) while it is running
+11. Force-quit akari (Activity Monitor → Force Quit, i.e. SIGKILL) while it is running
    and `ps aux | grep akari-core`. Within ~5s no core should be left behind.
-11. Speak, **pause mid-sentence for about a second**, then release ⌥Space. She should
+12. Speak, **pause mid-sentence for about a second**, then release ⌥Space. She should
    answer normally and the menu bar must **not** say "按得太短了…" — she heard you,
    and that message would invite a second press that really would cut her off.
-12. `make run-core` in one terminal, then start the app. Only one core process may
+13. `make run-core` in one terminal, then start the app. Only one core process may
    exist (`pgrep -fl src/index.ts`). Quit the app from the menu bar: the hand-run
    core must still be running.
-13. While she is talking, unplug or swap the audio output device (headphones out,
+14. While she is talking, unplug or swap the audio output device (headphones out,
    or disconnect an external display that carries audio). She must come back to
    `idle` when the reply ends — a stuck `talking` means the playback ledger kept
    an orphan count.
+15. `defaults delete me.eltonzheng.akari akari.onboardingShown`, then launch the
+   app **while another app is frontmost and full-screen**. The settings window
+   must appear *in front* with the two-credential explanation on it. Close the
+   app without dismissing the banner and launch again: the explanation must come
+   back, because nobody has read it yet. (Automated window-order checks pass;
+   this is the one that confirms a human can actually see it. Note that driving
+   this with `osascript` presses the banner's default button — check it by eye.)
+16. Paste a wrong DashScope key into the settings window and press 保存并测试
+   **while she is still able to talk**. The voice row must go red and say the
+   session is running on the old key — not stay green because a session exists.
+17. Export `CLOUDFLARE_API_TOKEN` in your shell with a value different from the
+   one in `.env`, then start the core. It must warn by name at startup, and the
+   settings window must say the effective value came from the shell.
+18. Pull the network (Wi-Fi off, or a captive portal that accepts and stalls) and
+   ask her something that uses the text route. Falling back must take ~15s, not
+   ~75s, and the menu bar must say she switched to the local model. **Blocked
+   until something calls `TextRouter.chat()`** — see the gaps above.
 
 ## Documents
 

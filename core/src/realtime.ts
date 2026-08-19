@@ -131,7 +131,12 @@ export type RenewReason =
   | "session_age"
   | "audio_turns"
   | "audio_seconds"
-  | "reconnect";
+  | "reconnect"
+  /** The DashScope key changed under us (ADR-009 §8.5). The socket carries the
+   *  old key in its handshake, so the only way to adopt a new one is a new
+   *  socket — but it still waits for a turn boundary like every other renewal,
+   *  because dropping mid-utterance loses the utterance. */
+  | "credentials";
 
 export interface RealtimeResponseInfo {
   responseId: string;
@@ -316,7 +321,12 @@ export function assertUsableEndpoint(
 export function configFromEnv(
   overrides: Partial<RealtimeConfig> = {},
 ): RealtimeConfig {
-  const apiKey = process.env.DASHSCOPE_API_KEY;
+  // The override wins over the environment rather than being spread on top of
+  // it, so a key that reached the core over the socket (Keychain, ADR-009 §8.3)
+  // is a complete configuration on its own. Without this the core would refuse
+  // to build a session it has a perfectly good key for, purely because the key
+  // did not arrive as an environment variable.
+  const apiKey = overrides.apiKey ?? process.env.DASHSCOPE_API_KEY;
   if (!apiKey) {
     throw new Error(
       "DASHSCOPE_API_KEY is not set (see .env.example; the value must never be logged)",
@@ -443,6 +453,27 @@ export class RealtimeClient {
   setTools(tools: RealtimeTool[]): void {
     this.tools = [...tools];
     if (this.connected) this.sendSessionUpdate();
+  }
+
+  /**
+   * Adopt a new DashScope key (the user saved one in the settings window).
+   *
+   * Returns true when a renewal was scheduled. The key is only used in the
+   * `Authorization` header of the WebSocket handshake, so a live session keeps
+   * running on the old one until it is replaced — deliberately: `maybeRenew`
+   * waits for a turn boundary, and cutting the socket mid-utterance would throw
+   * away what the user was in the middle of saying. A session that is not up
+   * yet just picks the new key up when it dials.
+   *
+   * Never logs the key, and never compares it to anything that is logged.
+   */
+  setApiKey(apiKey: string): boolean {
+    if (!apiKey || apiKey === this.config.apiKey) return false;
+    this.config.apiKey = apiKey;
+    if (!this.sessionReady) return false;
+    this.renewPending = "credentials";
+    this.maybeRenew();
+    return true;
   }
 
   /** Append one microphone chunk (PCM16LE at the uplink format). */

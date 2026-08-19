@@ -488,3 +488,57 @@ describe("failed responses", () => {
     expect(c.errors).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Hot-swapping the key (ADR-009 §8.5)
+// ---------------------------------------------------------------------------
+
+describe("setApiKey", () => {
+  test("a new key renews the session, because the handshake is where it is used", async () => {
+    const renewals: string[] = [];
+    const { client } = await connectClient({
+      onSessionRenewed: ({ reason }: { reason: string }) => renewals.push(reason),
+    });
+
+    expect(client.setApiKey("sk-a-different-key")).toBe(true);
+    await waitFor("renewal", () => renewals.length > 0);
+    expect(renewals).toEqual(["credentials"]);
+    expect(client.connected).toBe(true);
+  });
+
+  test("the same key again is not a reason to drop a paid session", async () => {
+    const renewals: string[] = [];
+    const { client } = await connectClient({
+      onSessionRenewed: ({ reason }: { reason: string }) => renewals.push(reason),
+    });
+
+    expect(client.setApiKey("test-key")).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(renewals).toEqual([]);
+  });
+
+  test("a key set before connecting is simply the key it dials with", () => {
+    const client = new RealtimeClient({ apiKey: "test-key" });
+    // Nothing to renew, so nothing is scheduled; `connect()` picks it up.
+    expect(client.setApiKey("sk-later")).toBe(false);
+    expect(client.connected).toBe(false);
+  });
+});
+
+describe("configFromEnv with an injected key", () => {
+  test("a key from the socket is a complete configuration on its own", () => {
+    const saved = process.env.DASHSCOPE_API_KEY;
+    try {
+      delete process.env.DASHSCOPE_API_KEY;
+      // ADR-009 §8.3: the Keychain path never touches process.env, so a config
+      // that could only be satisfied by an environment variable would make
+      // "credentials over the socket" unusable for voice.
+      expect(configFromEnv({ apiKey: "sk-from-the-keychain" }).apiKey).toBe(
+        "sk-from-the-keychain",
+      );
+      expect(() => configFromEnv()).toThrow(/DASHSCOPE_API_KEY/);
+    } finally {
+      restore("DASHSCOPE_API_KEY", saved);
+    }
+  });
+});

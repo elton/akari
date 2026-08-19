@@ -254,6 +254,298 @@ public struct LogPayload: Codable, Sendable {
     public var message: String
 }
 
+
+// MARK: - Settings and credentials (ADR-009, docs/protocol.md §3.9 / §3.10)
+
+/// Well-known route ids. Plain strings rather than an enum on purpose: see
+/// `ProviderID`.
+public enum SettingsRoute {
+    public static let voice = "voice"
+    public static let text = "text"
+}
+
+/// Well-known provider ids.
+///
+/// These are `String`, not a `Codable` enum, and so are `status`, `slot`,
+/// `source` and `state` below. A `Codable` enum throws on a raw value it has
+/// never heard of, which would turn "the core learned about a new provider"
+/// into "the settings window fails to decode and shows nothing" — the exact
+/// failure protocol.md §三 forbids by making unknown message types a no-op.
+/// Unknown values here render as an unavailable row instead.
+public enum ProviderID {
+    public static let dashscopeRealtime = "dashscope-realtime"
+    public static let cloudflareWorkersAI = "cloudflare-workers-ai"
+    public static let localMLX = "local-mlx"
+    /// `selected` value meaning "core decides"; never an `active` value.
+    public static let auto = "auto"
+}
+
+/// Well-known credential slot ids. Also the `kSecAttrAccount` of the Keychain
+/// item that holds each one (docs/protocol.md §八).
+public enum CredentialSlotID {
+    public static let dashscopeAPIKey = "dashscope.apiKey"
+    public static let cloudflareAccountID = "cloudflare.accountId"
+    public static let cloudflareAPIToken = "cloudflare.apiToken"
+    public static let huggingFaceToken = "huggingface.token"
+
+    public static let all = [
+        dashscopeAPIKey, cloudflareAccountID, cloudflareAPIToken, huggingFaceToken,
+    ]
+}
+
+public struct ProviderCapabilitiesPayload: Codable, Sendable, Equatable {
+    /// Accepts image input — this is what decides whether "看一下我的屏幕" works.
+    public var vision: Bool
+    public var tools: Bool
+    public var streaming: Bool
+    /// Context window in tokens, prompt + completion.
+    public var contextTokens: Int
+    public var maxOutputTokens: Int?
+    /// Inference happens on this machine; drives the privacy badge.
+    public var local: Bool
+
+    public init(vision: Bool, tools: Bool, streaming: Bool,
+                contextTokens: Int, maxOutputTokens: Int? = nil, local: Bool) {
+        self.vision = vision
+        self.tools = tools
+        self.streaming = streaming
+        self.contextTokens = contextTokens
+        self.maxOutputTokens = maxOutputTokens
+        self.local = local
+    }
+}
+
+/// Remaining allowance. Every field is optional: a provider that cannot get
+/// numbers sends `unit` and `note`, and the UI shows the note.
+public struct QuotaSnapshotPayload: Codable, Sendable, Equatable {
+    public var unit: String
+    public var used: Double?
+    public var limit: Double?
+    public var remaining: Double?
+    /// Unix epoch milliseconds when the allowance resets.
+    public var resetsAt: Int64?
+    public var note: String?
+
+    public init(unit: String, used: Double? = nil, limit: Double? = nil,
+                remaining: Double? = nil, resetsAt: Int64? = nil, note: String? = nil) {
+        self.unit = unit
+        self.used = used
+        self.limit = limit
+        self.remaining = remaining
+        self.resetsAt = resetsAt
+        self.note = note
+    }
+}
+
+public struct ProviderHealthPayload: Codable, Sendable, Equatable {
+    public var provider: String
+    /// `ok` | `unconfigured` | `unauthorized` | `quota_exhausted` |
+    /// `unreachable` | `model_missing` | `starting` | `error` | `unknown`.
+    public var status: String
+    /// One line for the user. Never carries a credential.
+    public var message: String?
+    /// Credential slots that are empty; set when `status == "unconfigured"`.
+    public var missing: [String]?
+    public var model: String?
+    public var capabilities: ProviderCapabilitiesPayload?
+    public var quota: QuotaSnapshotPayload?
+    public var latencyMs: Int?
+    /// Unix epoch ms of the last probe; 0 when never probed.
+    public var checkedAt: Int64
+
+    public var isOK: Bool { status == "ok" }
+
+    public init(provider: String, status: String, message: String? = nil,
+                missing: [String]? = nil, model: String? = nil,
+                capabilities: ProviderCapabilitiesPayload? = nil,
+                quota: QuotaSnapshotPayload? = nil, latencyMs: Int? = nil,
+                checkedAt: Int64) {
+        self.provider = provider
+        self.status = status
+        self.message = message
+        self.missing = missing
+        self.model = model
+        self.capabilities = capabilities
+        self.quota = quota
+        self.latencyMs = latencyMs
+        self.checkedAt = checkedAt
+    }
+}
+
+public struct RouteStatePayload: Codable, Sendable, Equatable {
+    public var route: String
+    /// A provider id, or `ProviderID.auto`.
+    public var selected: String
+    /// What is serving right now; nil when nothing on this route works.
+    public var active: String?
+    /// Every provider that could serve this route, in fallback order.
+    public var candidates: [ProviderHealthPayload]
+
+    public init(route: String, selected: String, active: String?,
+                candidates: [ProviderHealthPayload]) {
+        self.route = route
+        self.selected = selected
+        self.active = active
+        self.candidates = candidates
+    }
+}
+
+/// One credential slot, without the credential.
+public struct CredentialSlotStatePayload: Codable, Sendable, Equatable {
+    public var slot: String
+    /// `app` | `env` | `unset`.
+    public var source: String
+    public var present: Bool
+    /// First 8 hex of SHA-256 of the value: lets both sides compare what they
+    /// hold without either of them sending it.
+    public var fingerprint: String?
+    /// Cleared in settings; the `.env` fallback is suppressed for this slot.
+    public var cleared: Bool?
+    /// The app could not read the Keychain.
+    public var denied: Bool?
+    /// Variable the `env` fallback reads, so the UI can name it.
+    public var envVar: String
+
+    public init(slot: String, source: String, present: Bool,
+                fingerprint: String? = nil, cleared: Bool? = nil,
+                denied: Bool? = nil, envVar: String) {
+        self.slot = slot
+        self.source = source
+        self.present = present
+        self.fingerprint = fingerprint
+        self.cleared = cleared
+        self.denied = denied
+        self.envVar = envVar
+    }
+}
+
+public struct EnvFileStatePayload: Codable, Sendable, Equatable {
+    public var path: String
+    public var loaded: Bool
+
+    public init(path: String, loaded: Bool) {
+        self.path = path
+        self.loaded = loaded
+    }
+}
+
+public struct SettingsStatePayload: Codable, Sendable, Equatable {
+    public var routes: [RouteStatePayload]
+    public var credentials: [CredentialSlotStatePayload]
+    /// Where the core looked for a `.env`, in the order it looked.
+    public var envFiles: [EnvFileStatePayload]
+
+    public init(routes: [RouteStatePayload],
+                credentials: [CredentialSlotStatePayload],
+                envFiles: [EnvFileStatePayload]) {
+        self.routes = routes
+        self.credentials = credentials
+        self.envFiles = envFiles
+    }
+}
+
+public struct SettingsSetPayload: Codable, Sendable, Equatable {
+    public var route: String
+    /// A provider id, or `ProviderID.auto`.
+    public var provider: String
+
+    public init(route: String, provider: String) {
+        self.route = route
+        self.provider = provider
+    }
+}
+
+public struct SettingsProbePayload: Codable, Sendable, Equatable {
+    public var route: String
+    /// nil probes every candidate on the route.
+    public var provider: String?
+    /// Give up after this long. Core default 10000; 0 is not allowed.
+    public var timeoutMs: Int?
+
+    public init(route: String, provider: String? = nil, timeoutMs: Int? = nil) {
+        self.route = route
+        self.provider = provider
+        self.timeoutMs = timeoutMs
+    }
+}
+
+public struct SettingsProbeResultPayload: Codable, Sendable, Equatable {
+    public var route: String
+    public var results: [ProviderHealthPayload]
+
+    public init(route: String, results: [ProviderHealthPayload]) {
+        self.route = route
+        self.results = results
+    }
+}
+
+/// The Keychain changed. Slot ids only — the values follow, and only because
+/// the core asks for them (docs/protocol.md §3.10).
+public struct CredentialsUpdatedPayload: Codable, Sendable, Equatable {
+    public var slots: [String]
+
+    public init(slots: [String]) {
+        self.slots = slots
+    }
+}
+
+public struct CredentialsRequestPayload: Codable, Sendable, Equatable {
+    public var requestId: String
+    public var slots: [String]
+
+    public init(requestId: String, slots: [String]) {
+        self.requestId = requestId
+        self.slots = slots
+    }
+}
+
+/// What the Keychain holds for one slot.
+///
+/// `cleared` and `unset` are different answers and the difference is
+/// load-bearing: `cleared` means the user deleted it here and the core must
+/// **not** fall back to `.env`; `unset` means it was never configured here and
+/// the fallback applies. `denied` is a locked Keychain — it falls back like
+/// `unset` so a locked Keychain cannot take voice down, and is reported
+/// separately so the UI can explain the empty field.
+public struct CredentialValuePayload: Codable, Sendable, CustomStringConvertible,
+                                      CustomDebugStringConvertible {
+    public var slot: String
+    /// `set` | `cleared` | `unset` | `denied`.
+    public var state: String
+    /// Present only when `state == "set"`.
+    ///
+    /// This is the one secret-bearing field in the whole protocol. It is never
+    /// logged, never shown, never put in an error — which is why this type
+    /// prints itself without it.
+    public var value: String?
+
+    public init(slot: String, state: String, value: String? = nil) {
+        self.slot = slot
+        self.state = state
+        self.value = state == "set" ? value : nil
+    }
+
+    public var description: String { "CredentialValue(\(slot), \(state))" }
+    public var debugDescription: String { description }
+}
+
+public struct CredentialsProvidePayload: Codable, Sendable, CustomStringConvertible,
+                                         CustomDebugStringConvertible {
+    public var requestId: String
+    /// Answers only the slots the request named.
+    public var values: [CredentialValuePayload]
+
+    public init(requestId: String, values: [CredentialValuePayload]) {
+        self.requestId = requestId
+        self.values = values
+    }
+
+    public var description: String {
+        "CredentialsProvide(\(requestId), \(values.map(\.description).joined(separator: ", ")))"
+    }
+    public var debugDescription: String { description }
+}
+
 // MARK: - Control messages
 
 public enum MessageType: String, Codable, Sendable {
@@ -273,6 +565,14 @@ public enum MessageType: String, Codable, Sendable {
     case clipboardReadRequest = "clipboard.read.request"
     case clipboardReadResponse = "clipboard.read.response"
     case uiNotice = "ui.notice"
+    case settingsGet = "settings.get"
+    case settingsState = "settings.state"
+    case settingsSet = "settings.set"
+    case settingsProbe = "settings.probe"
+    case settingsProbeResult = "settings.probeResult"
+    case credentialsUpdated = "credentials.updated"
+    case credentialsRequest = "credentials.request"
+    case credentialsProvide = "credentials.provide"
     case appQuit = "app.quit"
     case ping
     case pong
@@ -297,6 +597,14 @@ public enum ControlBody: Sendable {
     case clipboardReadRequest(ClipboardReadRequestPayload)
     case clipboardReadResponse(ClipboardReadResponsePayload)
     case uiNotice(UiNoticePayload)
+    case settingsGet
+    case settingsState(SettingsStatePayload)
+    case settingsSet(SettingsSetPayload)
+    case settingsProbe(SettingsProbePayload)
+    case settingsProbeResult(SettingsProbeResultPayload)
+    case credentialsUpdated(CredentialsUpdatedPayload)
+    case credentialsRequest(CredentialsRequestPayload)
+    case credentialsProvide(CredentialsProvidePayload)
     case appQuit
     case ping
     case pong
@@ -321,6 +629,14 @@ public enum ControlBody: Sendable {
         case .clipboardReadRequest: .clipboardReadRequest
         case .clipboardReadResponse: .clipboardReadResponse
         case .uiNotice: .uiNotice
+        case .settingsGet: .settingsGet
+        case .settingsState: .settingsState
+        case .settingsSet: .settingsSet
+        case .settingsProbe: .settingsProbe
+        case .settingsProbeResult: .settingsProbeResult
+        case .credentialsUpdated: .credentialsUpdated
+        case .credentialsRequest: .credentialsRequest
+        case .credentialsProvide: .credentialsProvide
         case .appQuit: .appQuit
         case .ping: .ping
         case .pong: .pong
@@ -385,6 +701,14 @@ public struct ControlMessage: Codable, Sendable {
         case .clipboardReadRequest: body = .clipboardReadRequest(try payload(ClipboardReadRequestPayload.self))
         case .clipboardReadResponse: body = .clipboardReadResponse(try payload(ClipboardReadResponsePayload.self))
         case .uiNotice: body = .uiNotice(try payload(UiNoticePayload.self))
+        case .settingsGet: body = .settingsGet
+        case .settingsState: body = .settingsState(try payload(SettingsStatePayload.self))
+        case .settingsSet: body = .settingsSet(try payload(SettingsSetPayload.self))
+        case .settingsProbe: body = .settingsProbe(try payload(SettingsProbePayload.self))
+        case .settingsProbeResult: body = .settingsProbeResult(try payload(SettingsProbeResultPayload.self))
+        case .credentialsUpdated: body = .credentialsUpdated(try payload(CredentialsUpdatedPayload.self))
+        case .credentialsRequest: body = .credentialsRequest(try payload(CredentialsRequestPayload.self))
+        case .credentialsProvide: body = .credentialsProvide(try payload(CredentialsProvidePayload.self))
         case .appQuit: body = .appQuit
         case .ping: body = .ping
         case .pong: body = .pong
@@ -418,7 +742,14 @@ public struct ControlMessage: Codable, Sendable {
         case .clipboardReadRequest(let p): try c.encode(p, forKey: .payload)
         case .clipboardReadResponse(let p): try c.encode(p, forKey: .payload)
         case .uiNotice(let p): try c.encode(p, forKey: .payload)
-        case .appQuit, .ping, .pong: break
+        case .settingsState(let p): try c.encode(p, forKey: .payload)
+        case .settingsSet(let p): try c.encode(p, forKey: .payload)
+        case .settingsProbe(let p): try c.encode(p, forKey: .payload)
+        case .settingsProbeResult(let p): try c.encode(p, forKey: .payload)
+        case .credentialsUpdated(let p): try c.encode(p, forKey: .payload)
+        case .credentialsRequest(let p): try c.encode(p, forKey: .payload)
+        case .credentialsProvide(let p): try c.encode(p, forKey: .payload)
+        case .settingsGet, .appQuit, .ping, .pong: break
         case .error(let p): try c.encode(p, forKey: .payload)
         case .log(let p): try c.encode(p, forKey: .payload)
         }

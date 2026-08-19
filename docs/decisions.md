@@ -419,6 +419,7 @@ Team ID，本项目还没有。所以：
 | 事项 | 卡在哪里 |
 | --- | --- |
 | `codesign` 档位的对端校验（core 验 app） | 需要 Apple Developer Team ID |
+| Keychain 用不了数据保护钥匙串，`kSecAttrAccessible` 实际不生效 | 同上；需要 Team ID 才签得出 `keychain-access-groups` 授权。实测 `SecItemAdd` 回 -34018，ad-hoc 塞授权会被 SIGKILL。当前保护退化成按代码签名匹配的 ACL，未签名构建下接近于零 —— 设置窗口如实写明（protocol.md §8.2） |
 | app 验 core 仍挡不住同 uid 的进程 | 同上；`stat` 到此为止，`LOCAL_PEERPID` 反查换不来实质保护（对端可执行文件是 `bun`） |
 | SIGKILL 掉 app 时的孤儿 core | 无解，只能靠 core 侧 5 秒轮询的看门狗兜底 |
 | RED 确认门从未被真人点过 | 需要 GUI 会话；目前只有 fake app 驱动的自动化覆盖 |
@@ -802,3 +803,129 @@ core 启动时按变量名 warn，且只在两边的值**真的不同**时才 wa
 
 **仍未验证**：图像输入（看屏幕截图）的实际延迟与质量；
 本地 LLM 推理与 60fps 形象渲染并发时的相互拖慢（spec §十 的待验证项 5）。
+
+---
+
+## ADR-010 · 凭据走 socket 索取，不走 core 的环境变量
+
+**日期**：2026-08-19  ·  **状态**：已确定（实现细节见 `docs/protocol.md` §八）
+
+**决策**：凭据存在 app 侧的 Keychain，core 需要时**通过 socket 向 app 要**
+（`credentials.request` / `credentials.provide`），**不**在 spawn core 时把它们注入
+子进程环境。`.env` 仍然是完整可用的第二来源，按槽退让。
+
+**这条为什么值得单独立一条 ADR**：ADR-009 只说了「用户要配两套凭据」，
+没说凭据怎么从 app 走到 core。方向性的选择实际发生在 protocol.md §8.3，
+但那是一份线上契约文档，读的人是来查帧格式的，不会把它当成决策来引用 —— 
+于是「为什么不是环境变量」这个问题在实施中被反复重新问了一遍。
+
+**落选方案与理由**：
+
+| 方案 | 落选理由 |
+| --- | --- |
+| spawn core 时注入环境变量 | 用户在设置窗口里换一把 key，就必须重启 core 才能生效；而重启 core 会掐掉一条**按时长计费**的 Realtime 会话。ADR-009 的「保存并测试」按钮在这个方案下要么骗人，要么烧钱 |
+| core 自己读 Keychain | core 是 `bun`，没有稳定的 bundle identity，Keychain ACL 挂不住；且这会让 `make run-core` 依赖一个 GUI 钥匙串 |
+| 只用 `.env` | 分发给他人时等于要求对方编辑文件；而设置窗口是 ADR-009 承诺的入口 |
+
+**第二条理由在实施中变得更重要**：本仓 `core/src/tools/builtin/process.ts`
+给子进程的环境是九个变量的白名单，理由写在那里 ——「一次 `run env` 就是整串钥匙」。
+凭据若进了 core 的环境，这条白名单保护的就只剩下半个进程树。
+
+**已经踩到的坑（这条 ADR 的实证）**：shell 里 export 的同名变量按常规 dotenv 语义
+压过 `.env`，症状是「同一个 token `curl` 200、程序 401」。本轮验证时**又踩了一次**
+（拿默认 shell 环境跑 provider 回归，CF 探测报 `unauthorized`；`env -u` 掉两个变量、
+改用 `.env` 的值之后同一段代码 `ok` 922ms、首 chunk 461ms）。
+顺序不改，但 core 启动时按变量名 warn，设置窗口也会指出「生效的值来自 shell」。
+
+**接受的代价**：core 单独跑（`make run-core`，没有 app）时只有 `.env` 一条来源；
+app 断线时 core 保留手上已有的值，不会因为要不到而把自己变成未配置。
+
+---
+
+## 第五轮：ADR-009 验证轮的修复与集成（2026-08-19）
+
+四组并行修复（onboarding / router-visibility / local-runtime / settings-ui）合并后，
+由集成方重跑一遍对抗性验证。**这一轮的价值几乎全在「真跑」上**：四组自述里
+判断正确、代码正确、测试也正确的东西，有一条在真机上完全不工作，
+而它恰好是唯一一条没人真启动过 app 去看的。
+
+### 接线补的一条
+
+`core/src/index.ts` 构造 `TextRouter` 时没有传 `onNotice`。
+router 组把降级提示做完了、测试也齐，但那条线没接上，`ui.notice` 一条也发不出去。
+已接：`onNotice: (level, text) => bridge.sendNotice(level, text)`。
+
+### [P2·新] 首启引导的窗口开在别的应用后面，而「已展示」的标记照常被消耗掉
+
+四组里唯一一条**只有单元测试、没人真启动过 app** 的修复。
+`FirstRunOnboarding.shouldPresent` 的判定逻辑是对的，
+但把它搬上屏幕的那一半在真机上不成立：
+
+- akari 是 `LSUIElement`。macOS 26 的激活是协作式的 —— 一个用户没有点过的
+  后台应用**拿不到前台**。实测（Chrome 在前台，真 `.app`，`open` 启动，
+  用 `CGWindowListCopyWindowInfo` 读全局窗口序）：`NSApp.activate()`、
+  `orderFrontRegardless()`、`setActivationPolicy(.regular)`、
+  以及把它们推迟一个 runloop turn —— **四种做法窗口一律排在 Chrome 后面**。
+- 而 `markPresented` 是在展示**之前**调用的（当时的理由是「宁可什么都不解释，
+  也不要永远解释」）。两件事合起来：用户第一次启动，看见的只是菜单栏多了个图标，
+  ADR-009 承诺的「首启把两套凭据讲清楚」永远不会发生 —— 这一次不会，以后也不会。
+
+**修法**（两处，都对着真机验证过）：
+
+1. 说明改成**窗口内的 banner**，不再是 `NSAlert` sheet；展示期间把窗口
+   `level` 抬到 `.floating`，用户点掉才落回 `.normal`。抬 level 是后台应用
+   唯一还能让窗口服务器听话的手段，而 banner 没有 sheet 与 level 之间那些麻烦，
+   它也正好压在它让用户去填的那几个输入框上面。
+2. 「已展示」改成**点掉才记**。用户点掉是这条说明真的到过人眼前的唯一证据。
+   代价是「展示到点掉之间进程死了会再解释一遍」，比「一次都没解释却记成解释过」便宜得多。
+
+实测（真 `.app`，Chrome 在前台，全程不用任何自动化去碰它）：
+窗口 layer=3、排在全局第一，banner 正文完整，偏好项**没有**被消耗；
+点掉之后 layer 回到 0、偏好项写入 1。
+
+> 走过的弯路值得记一笔：中途几次「banner 自己消失了」是**验证脚本自己造成的** ——
+> `osascript` 去查 System Events 会把默认按钮按掉。去掉自动化连跑 8 次，一次都没有复现。
+> 差点据此把一个不存在的 AppKit 行为写进注释里。
+
+### 对抗性复核：其余各条
+
+| 条目 | 结论 | 证据 |
+| --- | --- | --- |
+| [P1] key 粘错被报成「检查网络」 | **成立** | 对**真** DashScope 端点用伪造 key 真握手：`Expected 101 status code`[1002] → `unauthorized`（修前是 `unreachable`）；HTTP 复核回 `unauthorized`。对照组：解析不了的主机 → 1006 `Failed to connect` → 仍是 `unreachable`，没有修过头 |
+| [P1] 会话已连时「保存并测试」报绿 | **成立** | 用生产默认校验器对真服务跑：会话在、存着的 key 是坏的 → `unauthorized` +「还能说话是因为会话仍挂在旧 key 上」 |
+| [P2] Keychain 数据保护 | **仍然拿不到，但代码如实这么说** | 独立探针：`SecItemAdd` 带 `kSecUseDataProtectionKeychain` → **-34018**；不带则写入成功，读回属性 `[acct cdat class labl mdat svce]` —— **`pdmn` 确实不在里面**。这不是修复失效，这条修的本来就是「别再声称有」。窗口里橙字写明，遗留表有记录 |
+| [P2] 降级可见性 + `state.active` | **成立** | 真黑洞网络（本机 TCP 监听、accept 后一个字节都不回）：15.00s 降级，`state.active` 当场是 `local-mlx`，`onNotice` 发出一条 warn。**但见下面的边界** |
+| [P2] MLX 孤儿 | **成立** | 真 `.venv-mlx` 起真 `mlx_vlm.server`，两种情形都跑了：未加载权重 → `kill -9` 父进程后 +0.56s ppid 变 1、+1.7s 进程消失；**真加载完 27B 权重之后** → +1s 消失。两次 `pgrep -f mlx_vlm.server` 都为空 |
+| [P2] 挂死型网络 15s 兜底 | **成立** | 同上那次黑洞测量：**15.00s**，不是系统 TCP 超时的 ~75s |
+| 回归·CF 真实推理 | **没坏** | 真账号：probe `ok` 922ms，首 chunk 461ms，答出正常中文 |
+| 回归·function calling | **没坏** | 真 CF 调用回 `get_weather({"city":"东京"})` |
+
+### 边界：降级提示在当前构建里没有触发点
+
+`TextRouter.chat()` 至今**没有生产调用方**（这条上一轮已经记过，本轮仍然成立）。
+所以「降级时菜单栏会有一条提示」在模块层面是真的、有测试、线也接上了，
+但**用户现在触发不了它** —— 因为还没有任何入口会发起一次文本回合。
+这不是本轮的退化，是 ADR-009 文本那一路等一个调用方；写在这里是为了别让
+「P2 已清零」被读成「用户现在能看见降级提示了」。
+
+### 也没有调用方的：`warmup()` / `progress()`
+
+local 组按设置界面的需要做了 `LocalTextProvider.warmup()`（唯一能证明本地真能生成的调用）
+和 `progress()`，settings-ui 组没有加对应的按钮，两边都没做错 —— 只是这一轮没接上。
+**刻意没有顺手接到 `settings.probe` 上**：那个按钮现在是「探测这一路的全部候选」，
+让它顺带把 22.8 GB 装进内存是个没人会预期的副作用。记在遗留里，等界面那一轮。
+
+### 验证
+
+`make check`：swift build 零警告 / **swift test 168 passed** / typecheck 干净 /
+**bun test 379 pass 0 fail**（本轮进来时是 164 / 378）。
+新增测试都做了「隔离副本里撤掉修复、确认变红」：
+首启引导 3 条红、`state.active` 的冷却分支 5 条红（含既有 4 条）。
+
+**一条如实记下的不稳定**：`make check` 期间见过一次
+`realtime.test.ts` → 「abandoned turns · a long-enough press commits and asks for a reply」
+失败，报 `realtime socket closed during handshake: Connection ended`。
+之后单独重跑该文件 20 次、整套 bun test 跑 8 次，**0 次复现**（约 1/30）。
+`FakeRealtime` 是本机 loopback、不碰网络，最可能是机器忙时前一个用例
+`server.stop()` 释放的临时端口与下一个用例的 `port: 0` 撞上。
+是测试设施的竞态，不是产品代码；本轮没有修，记在这里以免下次被当成新问题。

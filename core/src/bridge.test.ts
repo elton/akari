@@ -20,6 +20,7 @@ import {
   type AudioFrame,
   type ControlBody,
   type ControlMessage,
+  type SettingsStatePayload,
 } from "./protocol.ts";
 
 /**
@@ -700,5 +701,244 @@ describe("audit peer attribution", () => {
     app.end();
     await Bun.sleep(20);
     expect(bridge.peerDescription).toBeUndefined();
+  });
+});
+
+describe("settings messages (protocol.md §3.9)", () => {
+  const snapshot = (selected: string): SettingsStatePayload => ({
+    routes: [
+      { route: "text", selected, active: "cloudflare-workers-ai", candidates: [] },
+    ],
+    credentials: [],
+    envFiles: [],
+  });
+
+  test("settings.get is answered with a settings.state carrying its id", async () => {
+    const { bridge, path } = await withBridge({
+      handlers: { onSettingsGet: () => snapshot("auto") },
+    });
+    const app = await connectedApp(bridge, path);
+
+    app.send({ type: "settings.get" });
+    const state = await app.expect("settings.state");
+    expect(state.replyTo).toBeDefined();
+    expect((payload(state)["routes"] as unknown[]).length).toBe(1);
+  });
+
+  test("a settings.set the core refuses is a bad_payload, and nothing was applied", async () => {
+    const attempts: string[] = [];
+    const { bridge, path } = await withBridge({
+      handlers: {
+        onSettingsSet: (p) => {
+          attempts.push(p.provider);
+          // Exactly what `TextRouter.select` does for a provider it has never
+          // heard of: refuse, and leave the state alone.
+          return p.provider === "local-mlx" ? snapshot(p.provider) : null;
+        },
+      },
+    });
+    const app = await connectedApp(bridge, path);
+
+    app.send({ type: "settings.set", payload: { route: "text", provider: "openai" } });
+    const error = await app.expect("error");
+    expect(payload(error)["code"]).toBe("bad_payload");
+    expect(payload(error)["fatal"]).toBe(false);
+    expect(app.take("settings.state")).toHaveLength(0);
+    expect(attempts).toEqual(["openai"]);
+  });
+
+  test("a route this core does not have never reaches the handler", async () => {
+    let called = false;
+    const { bridge, path } = await withBridge({
+      handlers: {
+        onSettingsSet: () => {
+          called = true;
+          return snapshot("auto");
+        },
+      },
+    });
+    const app = await connectedApp(bridge, path);
+
+    app.send({
+      type: "settings.set",
+      payload: { route: "images", provider: "auto" },
+    } as unknown as ControlBody);
+    await app.expect("error");
+    expect(called).toBe(false);
+  });
+
+  test("timeoutMs 0 is refused: a button that spins forever is not a state", async () => {
+    let probes = 0;
+    const { bridge, path } = await withBridge({
+      handlers: {
+        onSettingsProbe: async (p) => {
+          probes += 1;
+          return { route: p.route, results: [] };
+        },
+      },
+    });
+    const app = await connectedApp(bridge, path);
+
+    app.send({ type: "settings.probe", payload: { route: "text", timeoutMs: 0 } });
+    const error = await app.expect("error");
+    expect(payload(error)["message"]).toContain("timeoutMs");
+    expect(probes).toBe(0);
+  });
+
+  test("a probe that throws still answers, rather than leaving the app waiting", async () => {
+    const { bridge, path } = await withBridge({
+      handlers: {
+        onSettingsProbe: async () => {
+          throw new Error("the provider exploded");
+        },
+      },
+    });
+    const app = await connectedApp(bridge, path);
+
+    app.send({ type: "settings.probe", payload: { route: "text" } });
+    const result = await app.expect("settings.probeResult");
+    expect(payload(result)["route"]).toBe("text");
+    expect(payload(result)["results"]).toEqual([]);
+  });
+
+  test("nothing is pushed before the handshake", async () => {
+    const { bridge, path } = await withBridge();
+    const app = await FakeApp.connect(path);
+    await Bun.sleep(20);
+
+    bridge.sendSettingsState(snapshot("auto"));
+    await Bun.sleep(20);
+    // §3.9: no push before `core.ready`. An app that has not said hello is not
+    // known to speak this version of the protocol.
+    expect(app.take("settings.state")).toHaveLength(0);
+
+    app.send({
+      type: "app.hello",
+      payload: { protocolVersion: 1, appVersion: "0.1.0", appBuild: "1" },
+    });
+    await app.expect("core.ready");
+    bridge.sendSettingsState(snapshot("auto"));
+    await app.expect("settings.state");
+  });
+});
+
+describe("credentials (protocol.md §3.10)", () => {
+  test("the app's answer comes back to whoever asked, unknown slots dropped", async () => {
+    const { bridge, path } = await withBridge();
+    const app = await connectedApp(bridge, path);
+
+    const pending = bridge.requestCredentials(["dashscope.apiKey", "cloudflare.apiToken"]);
+    const request = await app.expect("credentials.request");
+    const requestId = payload(request)["requestId"] as string;
+    expect(payload(request)["slots"]).toEqual(["dashscope.apiKey", "cloudflare.apiToken"]);
+
+    app.send(
+      {
+        type: "credentials.provide",
+        payload: {
+          requestId,
+          values: [
+            { slot: "dashscope.apiKey", state: "set", value: "sk-secret" },
+            { slot: "cloudflare.apiToken", state: "cleared" },
+            // An account name is attacker-choosable; §3.10 says the core
+            // ignores slots it does not know rather than looking them up.
+            { slot: "../../etc/passwd", state: "set", value: "nope" },
+          ],
+        },
+      } as unknown as ControlBody,
+      request.id,
+    );
+
+    expect(await pending).toEqual([
+      { slot: "dashscope.apiKey", state: "set", value: "sk-secret" },
+      { slot: "cloudflare.apiToken", state: "cleared" },
+    ]);
+  });
+
+  test("a `set` with no value is dropped rather than stored as an empty secret", async () => {
+    const { bridge, path } = await withBridge();
+    const app = await connectedApp(bridge, path);
+
+    const pending = bridge.requestCredentials(["dashscope.apiKey"]);
+    const request = await app.expect("credentials.request");
+    app.send(
+      {
+        type: "credentials.provide",
+        payload: {
+          requestId: payload(request)["requestId"],
+          values: [{ slot: "dashscope.apiKey", state: "set" }],
+        },
+      } as unknown as ControlBody,
+      request.id,
+    );
+    expect(await pending).toEqual([]);
+  });
+
+  test("an app that does not answer in time yields null: keep what we have", async () => {
+    const { bridge, path } = await withBridge();
+    const app = await connectedApp(bridge, path);
+
+    const pending = bridge.requestCredentials(["dashscope.apiKey"], 40);
+    await app.expect("credentials.request");
+    // §八: a timeout means "keep the current values", never "revert to .env".
+    expect(await pending).toBeNull();
+  });
+
+  test("a disconnect settles the request as null, not as an empty answer", async () => {
+    const { bridge, path } = await withBridge();
+    const app = await connectedApp(bridge, path);
+
+    const pending = bridge.requestCredentials(["dashscope.apiKey"]);
+    await app.expect("credentials.request");
+    app.end();
+    expect(await pending).toBeNull();
+  });
+
+  test("with no app attached there is nobody to ask", async () => {
+    const { bridge } = await withBridge();
+    expect(await bridge.requestCredentials(["dashscope.apiKey"])).toBeNull();
+  });
+
+  test("credentials.provide never reaches the generic onMessage sink", async () => {
+    const seen: string[] = [];
+    const { bridge, path } = await withBridge({
+      handlers: { onMessage: (m) => seen.push((m as { type: string }).type) },
+    });
+    const app = await connectedApp(bridge, path);
+
+    const pending = bridge.requestCredentials(["dashscope.apiKey"]);
+    const request = await app.expect("credentials.request");
+    app.send(
+      {
+        type: "credentials.provide",
+        payload: {
+          requestId: payload(request)["requestId"],
+          values: [{ slot: "dashscope.apiKey", state: "set", value: "sk-secret" }],
+        },
+      } as unknown as ControlBody,
+      request.id,
+    );
+    await pending;
+    app.send({ type: "ping" });
+    await app.expect("pong");
+    await Bun.sleep(20);
+    // §3.10 rule 4: the one secret-bearing frame does not get handed to a
+    // general-purpose handler, where any future logging sink would find it.
+    expect(seen).not.toContain("credentials.provide");
+  });
+
+  test("credentials.updated reports slot names, and only known ones", async () => {
+    const reported: string[][] = [];
+    const { bridge, path } = await withBridge({
+      handlers: { onCredentialsUpdated: (slots) => reported.push([...slots]) },
+    });
+    const app = await connectedApp(bridge, path);
+
+    app.send({
+      type: "credentials.updated",
+      payload: { slots: ["cloudflare.apiToken", "not.a.slot"] },
+    } as unknown as ControlBody);
+    await Bun.sleep(30);
+    expect(reported).toEqual([["cloudflare.apiToken"]]);
   });
 });

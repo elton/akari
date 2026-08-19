@@ -114,6 +114,14 @@ payload 是**一个** UTF-8 JSON 对象，**不带换行、不做分隔** ——
 | `clipboard.read.request` | core → app | 读剪贴板（app 侧判断是否被标记为机密）|
 | `clipboard.read.response` | app → core | 剪贴板内容，或"已标记为机密"|
 | `ui.notice` | core → app | 一行给用户看的提示（菜单栏状态行）|
+| `settings.get` | app → core | 要一份当前设置快照 |
+| `settings.state` | core → app | 每一路在用哪个 provider、连通状态、额度 |
+| `settings.set` | app → core | 切换某一路的 provider |
+| `settings.probe` | app → core | 测试连接 |
+| `settings.probeResult` | core → app | 测试结果 |
+| `credentials.updated` | app → core | 钥匙串变了（只报槽名，不带值）|
+| `credentials.request` | core → app | 索取某几个槽的值 |
+| `credentials.provide` | app → core | **唯一携带凭据明文的消息** |
 | `app.quit` | 双向 | 请求退出 |
 | `ping` / `pong` | 双向 | 保活 |
 | `error` | 双向 | 错误 |
@@ -459,6 +467,217 @@ app 把它显示在菜单栏状态行上几秒，然后退回连接状态。
 
 `ui.notice` 不改变任何状态 —— 形象状态仍然只由 `avatar.setState` 决定。
 
+
+---
+
+### 3.9 设置（ADR-009）
+
+推理分成两条**可独立切换的路径**（route）：
+
+| `route` | 干什么 | 候选 provider |
+| --- | --- | --- |
+| `"voice"` | 语音对话（Realtime 端到端） | `dashscope-realtime` |
+| `"text"` | 文本与看截图 | `cloudflare-workers-ai`、`local-mlx` |
+
+**为什么是两条而不是三条。** ADR-009 的表格有三行，但第三行「兜底」不是用户
+去选的一条路，而是 `text` 这一路选不到人时往下落的那一档。把它建成第三条 route，
+设置界面上就会出现一个「当前两路互相矛盾时无意义」的开关。它在协议里表现为
+`RouteState.candidates` 的顺序，以及 `selected: "auto"`。
+
+**语音那一路只有一个候选**，仍然出现在这里 —— 界面要显示它的连通状态与凭据是否配好，
+这跟能不能切是两件事。
+
+#### 类型
+
+```ts
+type ProviderStatus =
+  | "ok" | "unconfigured" | "unauthorized" | "quota_exhausted"
+  | "unreachable" | "model_missing" | "starting" | "error" | "unknown";
+```
+
+| `status` | 含义 | 界面该让用户做什么 |
+| --- | --- | --- |
+| `ok` | 探测通过 | — |
+| `unconfigured` | 必需的凭据槽是空的，见 `missing` | 去填凭据 |
+| `unauthorized` | 凭据被拒（401 / 403） | 换一个 token，或补权限 —— **CF 的 token 只给「读取」时会列得出模型、跑推理 403**，消息里必须点名缺的是 Workers AI「编辑」 |
+| `quota_exhausted` | 限流或额度用尽（429） | 等窗口重置，或切本地 |
+| `unreachable` | 网络 / DNS / 超时，没人应答 | 检查网络 |
+| `model_missing` | 端点通了但模型 id 不存在（404），或本地权重缺失 | 换模型 / 等权重下完 |
+| `starting` | 本地运行时正在加载权重 | 等一下再试 |
+| `error` | 其它，看 `message` | — |
+| `unknown` | 从没探测过 | — |
+
+`ProviderHealth`：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `provider` | `string` | 是 | `"dashscope-realtime"` \| `"cloudflare-workers-ai"` \| `"local-mlx"` |
+| `status` | `string` | 是 | 上表取值 |
+| `message` | `string?` | 否 | 一行中文，直接展示。**不得包含凭据**，也不得原样转发上游错误体（它可能把 token 回显回来） |
+| `missing` | `string[]?` | 否 | 空着的凭据槽，`status="unconfigured"` 时填 |
+| `model` | `string?` | 否 | 这一行说的是哪个模型 |
+| `capabilities` | `object?` | 否 | `{ vision, tools, streaming, contextTokens, maxOutputTokens?, local }` |
+| `quota` | `object?` | 否 | `{ unit, used?, limit?, remaining?, resetsAt?, note? }`，全部可选 |
+| `latencyMs` | `number?` | 否 | 上次探测往返 |
+| `checkedAt` | `number` | 是 | 上次探测的 Unix 毫秒；从没探测过填 `0` |
+
+> `quota` 每个数字都是可选的，因为**能不能拿到额度数字尚未核实**：CF Workers AI
+> 按 neuron 计费，计数在 dashboard / analytics 那边，不在推理端点上。拿不到数字的
+> 实现只填 `unit` 与 `note`，界面显示 `note`。
+
+#### `settings.get` — app → core，无 payload
+
+core 回一条 `settings.state`（`replyTo` 填这条的 `id`）。
+
+#### `settings.state` — core → app
+
+```json
+{
+  "routes": [
+    { "route": "voice", "selected": "dashscope-realtime", "active": "dashscope-realtime",
+      "candidates": [ { "provider": "dashscope-realtime", "status": "ok", "checkedAt": 1755607200123 } ] },
+    { "route": "text", "selected": "auto", "active": "cloudflare-workers-ai",
+      "candidates": [
+        { "provider": "cloudflare-workers-ai", "status": "ok", "model": "@cf/qwen/qwen3.8-27b",
+          "capabilities": { "vision": true, "tools": true, "streaming": true,
+                            "contextTokens": 262144, "local": false },
+          "latencyMs": 312, "checkedAt": 1755607200123 },
+        { "provider": "local-mlx", "status": "model_missing",
+          "message": "权重还没下完。", "checkedAt": 1755607190000 }
+      ] }
+  ],
+  "credentials": [
+    { "slot": "dashscope.apiKey", "source": "app", "present": true,
+      "fingerprint": "3f9a1c02", "envVar": "DASHSCOPE_API_KEY" },
+    { "slot": "huggingface.token", "source": "unset", "present": false,
+      "cleared": true, "envVar": "HF_TOKEN" }
+  ],
+  "envFiles": [ { "path": "/Users/…/akari/.env", "loaded": true } ]
+}
+```
+
+`RouteState.selected` 是 provider id 或 `"auto"`；`active` 是**此刻真正在服务的那个**，
+一条路全挂时为 `null`。`credentials` 的字段见 §八。
+
+**core 在下列时刻主动推送 `settings.state`，不必等 `settings.get`**：路由的
+`selected` / `active` 变了、某个候选的 `status` 变了、凭据解析结果变了。
+握手完成（`core.ready` 已发出）之前不发。
+
+#### `settings.set` — app → core
+
+```json
+{ "route": "text", "provider": "local-mlx" }
+```
+
+`provider` 可以是 `"auto"`。core 应用之后回一条 `settings.state`（带 `replyTo`）。
+route 或 provider 不认识 → 回 `error{code:"bad_payload", fatal:false}`，**且不改动任何状态**。
+
+#### `settings.probe` — app → core
+
+```json
+{ "route": "text", "provider": "cloudflare-workers-ai", "timeoutMs": 10000 }
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `route` | `string` | 是 | |
+| `provider` | `string?` | 否 | 省略 = 探测这一路的全部候选 |
+| `timeoutMs` | `number?` | 否 | 缺省 10000。**不接受 `0`** —— 设置界面上一个永远转圈的按钮不是一种可用状态 |
+
+#### `settings.probeResult` — core → app
+
+```json
+{ "route": "text", "results": [ { "provider": "cloudflare-workers-ai", "status": "ok", "latencyMs": 312, "checkedAt": 1755607200123 } ] }
+```
+
+`replyTo` 填对应 `settings.probe` 的 `id`。
+
+**「测试连接」测的是已存的凭据，不是输入框里的字。** 探测消息里没有凭据字段，
+所以界面上的流程必然是「保存 → `credentials.updated` → `settings.probe`」，
+按钮文案应当是「保存并测试」。这是刻意的取舍：另一条路是让 `settings.probe`
+携带待测凭据，那就等于在一条为了显示状态而存在的消息上开了个凭据入口，
+而这条消息的 payload 是会被日志、错误、审计顺手带走的那一类。
+存一个错的 token 在用户自己机器的钥匙串里，代价远小于此。
+
+---
+
+### 3.10 凭据传递（ADR-009）
+
+凭据存在 app 侧的 **Keychain**，core 需要时向 app 要。存储方案、优先级与落选方案见 §八；
+这里只定义线上的三条消息。
+
+```
+app                                  core
+ |-- app.hello --------------------->|
+ |<------------------- core.ready ---|
+ |<--- credentials.request{cr-1} ----|   core 索取它关心的槽
+ |-- credentials.provide{cr-1} ----->|   ★ 唯一带明文的一帧
+ |<--- settings.state ---------------|   重建 provider 之后
+ |                                   |
+ |   （用户在设置里改了 CF token）      |
+ |-- credentials.updated{slots} ---->|   只报槽名
+ |<--- credentials.request{cr-2} ----|
+ |-- credentials.provide{cr-2} ----->|
+ |<--- settings.state ---------------|
+```
+
+#### `credentials.updated` — app → core
+
+```json
+{ "slots": ["cloudflare.accountId", "cloudflare.apiToken"] }
+```
+
+只报**哪些槽变了**，不带值。core 收到后对这些槽发 `credentials.request`。
+这一条可以随便记日志。
+
+#### `credentials.request` — core → app
+
+```json
+{ "requestId": "cr-2", "slots": ["cloudflare.accountId", "cloudflare.apiToken"] }
+```
+
+core 生成 `requestId`。app 5 秒不答，core 视同失败并沿用现有值（**不**退回 `.env`，
+见 §八「不同步时怎么办」）。
+
+#### `credentials.provide` — app → core
+
+```json
+{
+  "requestId": "cr-2",
+  "values": [
+    { "slot": "cloudflare.accountId", "state": "set", "value": "…" },
+    { "slot": "cloudflare.apiToken",  "state": "denied" }
+  ]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `requestId` | `string` | 是 | 原样回填 |
+| `values[].slot` | `string` | 是 | 见 §八 的槽表；core **忽略**不认识的槽名 |
+| `values[].state` | `string` | 是 | `"set"` \| `"cleared"` \| `"unset"` \| `"denied"` |
+| `values[].value` | `string?` | 视 state | **仅** `state="set"` 时出现 |
+
+`state` 的四个取值不是同义词，区别在 §八：
+
+- `set` —— 钥匙串里有，`value` 就是它
+- `cleared` —— 用户在设置里删掉了。**抑制 `.env` 回退**
+- `unset` —— 从没在这里配过。`.env` 回退生效
+- `denied` —— 钥匙串没解锁 / 拒绝访问。回退行为同 `unset`，但在
+  `settings.state` 里单独标 `denied:true`，好让界面解释这个空字段
+
+**这一帧的纪律，两侧同等约束：**
+
+1. **不得记录。** 任何级别都不行，包括 debug。可以记的只有 `requestId`、
+   `slot`、`state`，以及 §八 定义的 `fingerprint`。
+   Swift 侧 `CredentialValuePayload` / `CredentialsProvidePayload` 自定义了
+   `description`，把 `\(payload)` 这种写法从会泄漏变成不会 —— 有测试守着。
+2. app **只答**请求里点名的槽。
+3. app **只在自己拨号、且通过了 `SocketTrust` 校验的那条连接上**回答。
+4. core 不得把值放进 `settings.state`、`error`、`log`、`ui.notice` 或工具审计。
+5. `state != "set"` 时必须**不写** `value` 字段（Swift 侧构造器直接丢掉它）。
+
+
 ---
 
 ## 四、音频帧（`0x02` / `0x03`）
@@ -573,3 +792,141 @@ app                                  core
 - 加**可选字段**：不算破坏性变更，`v` 不变。
 - 改字段类型/取值、改帧布局、删消息：**必须**递增 `v`，
   并同步更新本文件与两个镜像文件。
+
+---
+
+## 八、凭据存储：Keychain 叠加 `.env`（ADR-009）
+
+### 8.1 四个凭据槽
+
+槽名（`slot`）在三个地方是同一个字符串：协议字段、Keychain 的 `kSecAttrAccount`、
+core 里 `CredentialSlot` 的取值。**不要为其中任何一处起别名。**
+
+| `slot` | 用途 | `.env` 变量 |
+| --- | --- | --- |
+| `dashscope.apiKey` | 语音（Realtime） | `DASHSCOPE_API_KEY` |
+| `cloudflare.accountId` | 文本 / 看截图 | `CLOUDFLARE_ACCOUNT_ID` |
+| `cloudflare.apiToken` | 同上。**需要 Workers AI「编辑」权限**，「读取」跑推理会 403（实测） | `CLOUDFLARE_API_TOKEN` |
+| `huggingface.token` | 拉本地权重（该 repo 是 gated） | `HF_TOKEN` |
+
+`cloudflare.accountId` 严格说不是秘密，但它和 token 是同一份配置、同一次修改、
+同一次失效，拆到两个地方存只会制造「改了一半」的状态。
+
+### 8.2 app 侧的 Keychain 布局
+
+| 属性 | 值 |
+| --- | --- |
+| class | `kSecClassGenericPassword` |
+| `kSecAttrService` | `"me.eltonzheng.akari"`（= bundle id） |
+| `kSecAttrAccount` | 槽名，如 `"dashscope.apiKey"` |
+| `kSecAttrAccessible` | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` —— **请求了，当前构建下没有生效**，见下 |
+| value | 凭据的 UTF-8 字节；**长度为 0 表示「用户明确清空了」** |
+
+- `WhenUnlocked`：core 只在用户登录并解锁时才会被拉起来，不需要更宽的档位。
+- `ThisDeviceOnly`：不进 iCloud 钥匙串。这些凭据配的是**这台机器上的** core，
+  同步到一台没装 akari 的设备上没有用途，只是多一份副本。
+- **`kSecAttrAccessible` 只在数据保护钥匙串上是真的访问控制。** 落在登录（文件）钥匙串上时，
+  这个属性被 API 收下然后丢掉：把探针条目写进去再读回属性，返回的键是
+  `["acct","cdat","class","labl","mdat","svce"]` —— **`pdmn` 根本不在里面**（实测）。
+  要用数据保护钥匙串就得在每个查询上带 `kSecUseDataProtectionKeychain: true`，
+  而它需要 `keychain-access-groups` / `application-identifier` 授权，
+  **没有 Apple Developer Team ID 就签不出来**（实测：`SecItemAdd` 回
+  `errSecMissingEntitlement` -34018；用 ad-hoc 签名把授权塞进去，进程在 exec 时被内核 SIGKILL）。
+  所以当前构建的凭据躺在登录钥匙串里，实际保护是按代码签名匹配的 ACL —— 未签名 / ad-hoc
+  签名下每次重编译都会变，接近于零，也是反复弹「akari 想访问钥匙串」的原因。
+  **这与 core 的 `codesign` 对端校验卡在同一件事上**，见 decisions.md 的遗留表。
+  app 侧的 `KeychainCredentialStore.dataProtectionAvailable` 每次启动实测一次，
+  设置窗口按实测结果如实显示，不假装生效。
+- **长度为 0 的墓碑必须用「删掉再加」写。** `SecItemUpdate` 带一个零长度
+  `kSecValueData` 在登录钥匙串上回 `errSecSuccess` 并**保留原值**（实测），
+  于是「清空」会报成功而凭据还在，`.env` 抑制根本没发生。
+- **「没有这一项」与「有这一项但长度为 0」是两回事**，对应 `unset` 与 `cleared`
+  （§3.10）。这是把「用户删掉了它」这件事记下来的最省的编码 —— 不需要额外的墓碑存储。
+
+### 8.3 core 怎么拿到：走 socket 要，不走环境变量
+
+**决定：core 通过 socket 向 app 索取（§3.10），不由 app 在 spawn 时注入环境变量。**
+
+选它的三条理由：
+
+1. **凭据要能热换。** 设置界面上「保存并测试」必须当场生效。环境变量只在 spawn
+   那一刻定死，改凭据就得重启 core —— 而重启 core 会掐掉一条**按时长计费**的
+   Realtime 会话（ADR-004），且 app 那边还要走一遍自启/探测的那套逻辑
+   （decisions.md 第二轮第 2 条）。为改一个 CF token 付这个代价是荒唐的。
+2. **本仓已经把「密钥不进环境」立成了规矩。** 上一轮加固给子进程做了 9 项白名单
+   环境（`core/src/tools/builtin/process.ts`），理由原文是「一次注入的
+   `run env` 就是整把钥匙」。把凭据放回 core 自己的环境，等于在这条规矩的
+   上游把口子重新开出来：往后任何一处忘了用白名单的 spawn 都会重新泄漏。
+   环境变量还会出现在同 uid 可读的进程信息、崩溃报告和任何一次顺手的 `env` dump 里。
+3. **威胁模型上并不吃亏。** 两个方案都挡不住同 uid 的攻击者：它既能读进程环境，
+   也能读 0600 的 `.env`。socket 方案没有让这一格变得更差（见 8.6）。
+
+**落选方案（a）app 在 spawn 时注入环境变量**：实现最简单，且不需要新增协议消息；
+但它同时踩了上面三条的前两条，而它省下的复杂度只有两条消息。
+
+代价要说清楚：这条路让**凭据明文经过 socket**。这条 socket 是 0600、位于 0700
+目录下的 unix domain socket，两端各自做了对端校验（decisions.md「安全加固」一节），
+但 app 验 core 这一侧的上限就是 `stat` —— 见 8.6。
+
+### 8.4 优先级：**按槽**，app 优先
+
+```
+app 提供的（Keychain） →  process.env（含 .env） →  未配置
+```
+
+- **按槽（per slot），不是按来源。** 钥匙串里只填了 DashScope，CF 仍然从 `.env` 读。
+  否则一次填了一半的配置会把一份本来能用的 `.env` 整个作废。
+- **app 优先。** 设置界面是用户刚刚动过手的地方；让它输给一个用户早就忘了的文件，
+  是最难被报告出来的那种 bug。
+- **`.env` 一直有效，而且是唯一完整的无界面配置。** `make run-core` 没有 app，
+  也就永远不会有 `app` 来源的值 —— 那条路径必须、也确实只靠 `.env` 就能跑起来。
+  Keychain 是**叠加**，不是替代。
+- 空白值（全是空格）在任何一侧都按「没有」处理。
+
+`settings.state.credentials[]` 逐槽汇报解析结果：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `slot` | `string` | 见 8.1 |
+| `source` | `string` | `"app"` \| `"env"` \| `"unset"` |
+| `present` | `boolean` | 解析出了一个可用的值 |
+| `fingerprint` | `string?` | 值的 SHA-256 前 8 位十六进制；`source="unset"` 时省略 |
+| `cleared` | `boolean?` | 用户在设置里清空了这一槽，`.env` 回退已被抑制 |
+| `denied` | `boolean?` | app 读不到钥匙串（锁着 / 被拒） |
+| `envVar` | `string` | 这一槽回退去读哪个变量，好让界面直接把名字告诉用户 |
+
+**`fingerprint` 为什么是哈希前缀而不是「后四位」。** 后四位是凭据本身的一部分；
+高熵 API key 的 32 位哈希前缀不是可用的爆破口，而它足够回答「变了没有」和
+「两边拿的是不是同一份」。app 手里有明文，要在自己的输入框里显示 `sk-…3f9a`
+是它自己的事，core 不参与。
+
+### 8.5 不同步时怎么办
+
+| 情况 | 行为 |
+| --- | --- |
+| 两边都有，值相同（fingerprint 相同） | `source="app"`，**不重建任何 provider**。这是用户把 `.env` 里的 key 复制进设置界面之后的常态，为它重建等于白丢一轮对话 |
+| 两边都有，值不同 | app 赢。core 记一条 warn：`credential X: app value overrides .env`（只有 fingerprint，没有值），并重建依赖该槽的 provider |
+| 只有 `.env` | `source="env"`，照常工作 |
+| app 报 `cleared` | 视为未配置，**且不回退 `.env`**。依赖它的 provider 变成 `unconfigured` |
+| app 报 `denied`（钥匙串锁着） | 回退 `.env`。锁着的钥匙串不该顺带把语音一起弄没 |
+| app 从没连上过 | 只有 `.env`。这就是 `make run-core` |
+| app 断线 | core **保留**最后一次拿到的值，不回退 `.env`。中途换回另一份凭据等于悄悄换了计费账号，还会连带掐掉语音会话 |
+| `credentials.request` 超时（5s） | 同「断线」：沿用现有值，记 warn |
+
+**哪些槽变了要重建什么**：`dashscope.apiKey` 变 → 续一次 Realtime 会话
+（`RealtimeClient` 已有 `renewSession`，代价是一轮）；`cloudflare.*` 变 →
+重建 CF provider（无状态，无代价）；`huggingface.token` 变 → 不影响已加载的本地模型。
+**只对真正变了的槽做这件事** —— core 侧 `CredentialResolver.applyFromApp()`
+返回的就是这个列表。
+
+### 8.6 已知缺口
+
+- **同 uid 的假 core 能骗到凭据。** app 验 core 只有 `lstat`（属主 / 0600 / 0700 /
+  非符号链接），同 uid 的进程可以 unlink 掉真 socket 再 bind 一个一模一样的
+  —— decisions.md 里已经实测演示过这条，用它骗出过剪贴板全文。现在它能多骗到凭据。
+  **这不是新增的攻击面**：同一个攻击者本来就能直接读 0600 的 `.env`。
+  真正终结它的是代码签名档的对端校验（`SecCodeCopyGuestWithAttributes`），
+  卡在还没有 Apple Developer Team ID，`PeerIdentity.auditToken` 已经在采集了。
+- **`.env` 仍是明文文件。** 保留它是用户明确要求，也是无界面路径的唯一配置来源。
+  它的权限不由本协议保证。
+- **额度数字未必拿得到**（§3.9），`quota` 全字段可选就是为此。
