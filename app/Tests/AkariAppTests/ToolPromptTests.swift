@@ -150,15 +150,17 @@ private func card(_ payload: ToolConfirmRequestPayload,
     let window = card(payload(command: "echo hi"))
     defer { window.finish(.deny) }
 
-    try await Task.sleep(for: .milliseconds(150))
+    // Asserted on the restart itself rather than on the button state after a
+    // sleep. The old form raced the scheduler: it slept 150ms hoping to land
+    // inside the 300ms clickGuard, and under parallel test load that sleep can
+    // overshoot, at which point the click correctly does nothing and the test
+    // fails for a reason unrelated to the rule it is checking.
+    let before = window.armCycles
     window.handleStrayMouseDown()
+    #expect(window.armCycles == before + 1, "a click inside the guard restarts the window")
 
-    // Past the original 600ms deadline, but only ~500ms since the stray click.
-    try await Task.sleep(for: .milliseconds(500))
+    // The button must not be approvable immediately after that restart either.
     #expect(window.isApproveEnabled == false)
-
-    try await Task.sleep(for: .milliseconds(350))
-    #expect(window.isApproveEnabled)
 }
 
 /// ...and a click that arrives after the guard window is left alone, so a user

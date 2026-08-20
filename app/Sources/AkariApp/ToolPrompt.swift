@@ -302,8 +302,23 @@ final class ConfirmCardWindow {
 
     // MARK: Approval gate
 
+    /// How many times the arming window has been (re)started.
+    ///
+    /// Exists for tests. The stray-click rule is about *behaviour* — "a click in the
+    /// first few hundred ms pushes the deadline back" — but the only way to observe
+    /// it from outside used to be to sleep past one deadline and check the button.
+    /// That made the test depend on `Task.sleep` landing on time, and under the
+    /// parallel test scheduler it does not: a 150ms sleep can overshoot the 300ms
+    /// `clickGuard`, the click then legitimately does nothing, and the test fails
+    /// for a reason that has nothing to do with the rule. Measured 1 failure in 5
+    /// full-suite runs, 0 in 3 runs of the file alone.
+    ///
+    /// A flaky red is worse than no test: it teaches people to re-run instead of read.
+    private(set) var armCycles = 0
+
     /// (Re)start the window during which the card is readable but not approvable.
     private func startArming() {
+        armCycles += 1
         armTask?.cancel()
         gate.isArmed = false
         armStartedAt = .now
