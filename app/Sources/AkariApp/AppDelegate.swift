@@ -20,7 +20,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotkey = PushToTalkHotkey()
     private let prompts = ToolPromptPresenter()
     private let core = CoreProcess()
-    private let settings = SettingsStore()
+    /// Built before `settings` because the store takes it: the 形象 section's
+    /// wallpaper switch has to be able to reach the real desktop, and the store
+    /// is what the switch talks to.
+    private lazy var wallpaper = WallpaperController(directory: WallpaperCatalog.defaultDirectory())
+    private lazy var settings = SettingsStore(wallpaper: wallpaper)
     private lazy var settingsWindow = SettingsWindowController(store: settings)
 
     /// One player per display: a `CALayer` has a single superlayer, so the two
@@ -55,6 +59,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wireBridge()
 
         windows.start()
+        // Only two Bools cross this line on purpose (Wallpaper.swift): the
+        // module needs "the switch is on" and "the question was answered", and
+        // nothing else. A missing artwork file logs and leaves the desktop alone.
+        wallpaper.applyAtLaunch(enabled: settings.avatar.wallpaperEnabled,
+                                consented: settings.avatar.wallpaperConsented)
         requestMicrophoneAccessAtLaunch()
         // Deferred one runloop turn past `applicationDidFinishLaunching`.
         // Ordering a window to the front from inside launch does not survive:
@@ -150,6 +159,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func wireSettings() {
         settings.send = { [weak self] message in
             try? self?.bridge.send(message)
+        }
+
+        // The 形象 section edits exactly the value the window controller takes,
+        // so this is an assignment and not a translation. Once here for what was
+        // persisted, then on every accepted change — `onAvatarSettingsChanged`
+        // deliberately does not fire at construction time.
+        //
+        // Assigned before `windows.start()`, so the first windows are built in
+        // the mode the user last chose instead of appearing on the desktop layer
+        // and jumping.
+        windows.presentation = settings.avatar.presentation
+        settings.onAvatarSettingsChanged = { [weak self] value in
+            self?.windows.presentation = value.presentation
         }
     }
 
@@ -365,7 +387,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyAvatarState(_ state: AvatarState, transitionMs: Int?) {
         avatarState = state
         menu.setAvatarState(state)
-        let duration = transitionMs.map { Double($0) / 1000.0 } ?? 0.12
+        // The core may specify a duration; when it does not, the length is decided
+        // by what the transition means (AvatarPlayer.defaultDuration), not by one
+        // constant for every state.
+        let duration = transitionMs.map { Double($0) / 1000.0 }
+            ?? AvatarPlayer.defaultDuration(to: state)
         for player in players.values {
             player.transition(to: state, duration: duration)
         }

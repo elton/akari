@@ -46,3 +46,24 @@ for pair in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" "128 128x128" \
 done
 iconutil -c icns $ICON -o assets/brand/AppIcon.icns
 ```
+
+## 配套壁纸
+
+`WallpaperCatalog`（`app/Sources/AkariApp/Wallpaper.swift`）按这套约定找图，
+目录是 `assets/brand/wallpaper/`（`make app-bundle` 会拷进 `Contents/Resources/wallpaper`）：
+
+| 文件名 | 用途 |
+| --- | --- |
+| `akari-wallpaper-light.{heic,png,jpg}` | 浅色外观 |
+| `akari-wallpaper-dark.{heic,png,jpg}` | 深色外观 |
+| `akari-wallpaper.{heic,png,jpg}` | 两种外观通用（只放一张时用这个） |
+
+精确命中优先；都没有的时候退回按「文件名以 `akari-wallpaper` 开头 + 像素数最接近母版」
+挑一张。母版是 **5120×2880**（5K 屏物理像素，16:9，sRGB）；比它小会照用，
+但会在日志里说一声「放大后会发虚」。`.heic` 排在最前 —— 同一张图约 1/3 的字节数，
+而且是硬件解码。
+
+**这些文件不进 git**（见 `.gitignore` 里那段）：一张 5K PNG 就有 16MB，
+和这个仓库不收 `*.mov` 是同一条理由。缺图不致命 —— `WallpaperController` 会报
+「找不到配套壁纸」，桌面原样留给用户。要用就把图放进上面那个目录，
+或者用 `AKARI_WALLPAPER_DIR` 指到别处。

@@ -30,7 +30,7 @@ desktop, keeping you company and illuminating whatever you are working on.
 | Layer | Choice | Why |
 | --- | --- | --- |
 | Avatar | Pre-rendered AI video loops, HEVC-with-alpha | No realtime photoreal avatar runs on Apple Silicon in 2026 |
-| Window | `NSWindow.level = desktopIconWindow - 1` | Sits above wallpaper, below desktop icons. Zero entitlements |
+| Window | Two shapes the user picks between: `desktopIconWindow - 1` (above wallpaper, below desktop icons) or `.floating` (3 — above every ordinary window, below Dock/menu bar) | The desktop layer costs nothing but disappears under a full screen of windows; the floating layer is always there and always in the way. ADR-011. Zero entitlements either way |
 | Voice | `qwen3.5-omni-flash-realtime` over WebSocket | Measured 473ms to first audio packet; server-side VAD and barge-in |
 | Brain | Your own Cloudflare Workers AI `@cf/qwen/qwen3.8-27b`, falling back to local `Qwen3.8-27B-MLX` 6-bit | ADR-009: text and screenshots bill to the user's own account; local is the offline/out-of-quota floor |
 | Control | Accessibility API + Shortcuts + shell, four-tier risk gating | GUI agents are ~86% accurate — one misstep every 7 actions |
@@ -226,7 +226,11 @@ already taken by something else.
 | The local runtime does not outlive the core | The real `.venv-mlx` serving `mlx_vlm.server` over a real socket, `kill -9` on its parent. Reparented to PID 1 within 0.56s and gone by 1.7s; repeated **with the 27B weights actually loaded**, gone within 1s. `pgrep -f mlx_vlm.server` empty both times |
 | Keychain protection, measured not assumed | A probe binary at the app's own signing status: `SecItemAdd` with `kSecUseDataProtectionKeychain` answers **-34018**, and without it the item comes back with attributes `[acct cdat class labl mdat svce]` — **no `pdmn`**. `kSecAttrAccessible` is requested and not enforced, which is what the settings window now says out loud |
 | Cloudflare Workers AI, for real | The assembled core, driven over the socket by a stand-in app, probed `@cf/qwen/qwen3.8-27b` on the repo's own account: `ok` in 1157ms with a real neuron count (162 that day) read back over GraphQL. A deliberately wrong model id came back HTTP **400 + CF code 7000**, not 404, and mapped to `model_missing`. Re-checked after the ADR-009 fix round: probe `ok` 922ms, first chunk 461ms, and function calling still returns `get_weather({"city":"东京"})` |
-| Test suite | `make check`: `swift build` (zero warnings) + 168 `swift test` + `tsc --noEmit` + 379 `bun test` |
+| Floating layer, from outside the process | The real app switched to 浮动层 **through its own settings window**, then dumped from a separate process: level **3**, above every ordinary window (Chrome/IDEA/Finder at 0), below other apps' pinned panels (8), the Dock (20), the menu bar (24) and Control Centre (25). Anchor and size changes land live — `topLeading`+24pt → `x=24,y=0,324x432`; `bottomTrailing`+100pt at 50% → `x=1920,y=720,540x720` on a 2560x1440 panel, and the mirrored `x=-640` on the second one |
+| Floating over a real full-screen app | TextEdit taken full screen via `AXFullScreen` (a genuine full-screen space, not a two-process stand-in): the full-screen window fills 2560x1440 at level 0 and both akari windows stay on screen at level 3, ahead of it in the front-to-back list |
+| Click-through | Three points inside the floating window's bounds through `AXUIElementCopyElementAtPosition` on the system-wide element: every one returned an element belonging to **Google Chrome underneath**, never to akari |
+| Wallpaper, applied and restored for real | On a machine whose wallpaper was an Aerial: the read-only store probe classified it `notAnImage(aerials)` and the first attempt was **refused with the desktop untouched**. Over a plain image instead, `applyBundledWallpaper()` → `desktopImageURL` reads back akari's artwork on both displays, `restoreOriginal()` → reads back the original on both. The Aerial was then put back byte-for-byte (`Index.plist` sha unchanged) and confirmed by capturing the Dock's `Wallpaper-<UUID>` window |
+| Test suite | `make check`: `swift build` (zero warnings) + 237 `swift test` + `tsc --noEmit` + 379 `bun test` |
 
 ### Compiles and is wired, but not yet exercised
 
@@ -234,8 +238,15 @@ already taken by something else.
   TCC prompt. Everything downstream of it is proven with synthesized audio instead.
 - **Speaker playback.** `AVAudioPlayerNode` rendering of the downlink PCM, and the
   `audio.end` → drain → `audio.done` pairing.
-- **The avatar on screen.** The windows are provably in the right layer, but nothing
-  has watched a clip play there.
+- **The avatar on screen.** The windows are provably in the right layer and the
+  right size, but nothing has watched a clip play there — the geometry is measured
+  from outside the process, not looked at.
+- **Full-screen games.** `.fullScreenAuxiliary` is measured over ordinary AppKit
+  full screen (including a real app bundle). A game that takes the display
+  exclusively is untested.
+- **Dragging her.** Not built. Dragging and click-through are the same switch;
+  `DesktopWindowController.presentation` is live-settable so a drag only has to
+  turn a point back into `anchor` + `offset` (ADR-011 §6).
 - **Confirmation cards and undo toasts.** The panels build and the core-side gate is
   tested against a fake app; no human has clicked one.
 - **Power saving.** Occlusion sampling and pausing on lock/sleep.

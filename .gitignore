@@ -35,3 +35,13 @@ models/
 # Brand assets are small and are the source of truth for the app icon.
 !assets/brand/*.png
 !assets/brand/*.icns
+
+# The companion wallpaper is NOT tracked, on purpose. The three files that live
+# in assets/brand/wallpaper/ are 35MB of PNG between them, which is the same
+# "large binary" this file already keeps out for *.mov — and two of the three
+# (2560x1440, 5504x3072) can never be chosen anyway, because
+# WallpaperCatalog.rank picks the file closest to the 5120x2880 master and that
+# is the master itself on every display. A missing artwork file is not fatal:
+# WallpaperController reports 「找不到配套壁纸」 and leaves the desktop alone.
+# See assets/brand/README.md for the naming convention.
+assets/brand/wallpaper/

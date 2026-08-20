@@ -106,6 +106,7 @@ private struct SettingsRootView: View {
                     OnboardingBanner(text: onboarding) { store.dismissOnboarding() }
                 }
                 HeaderView(store: store)
+                AvatarSection(store: store)
                 ForEach(routeIDs, id: \.self) { route in
                     RouteSection(store: store, route: route)
                 }
@@ -471,5 +472,454 @@ private struct SectionBox<Content: View>: View {
             content
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - Avatar
+
+/// Renders a `String` that carries markdown emphasis.
+///
+/// `Text("literal")` parses markdown because the literal becomes a
+/// `LocalizedStringKey`; `Text(someString)` does not, and would print the
+/// asterisks. The explanation strings live in `SettingsDisplay` as data, so they
+/// take this route.
+private struct MarkdownText: View {
+    let string: String
+    init(_ string: String) { self.string = string }
+    var body: some View { Text(LocalizedStringKey(string)) }
+}
+
+/// 形态 / 位置与大小 / 多显示器 / 配套壁纸.
+///
+/// The section exists because of a trade-off that was never put to the user: the
+/// desktop layer puts her under every window, which is exactly where an "AI
+/// companion" stops being company. Everything here is a preference this window
+/// owns end to end — no core round-trip — so it keeps working with `core 未连接`.
+private struct AvatarSection: View {
+    let store: SettingsStore
+    @State private var previewState: AvatarState = .idle
+    @State private var showGroundingDetail = false
+
+    var body: some View {
+        SectionBox(title: "形象", subtitle: "她画在哪一层、站在哪里、多大，以及要不要配套壁纸。") {
+            ModePicker(store: store)
+            Divider()
+            PlacementEditor(store: store,
+                            previewState: $previewState,
+                            showGroundingDetail: $showGroundingDetail)
+            Divider()
+            DisplayScopePicker(store: store)
+            Divider()
+            WallpaperControls(store: store)
+        }
+        .confirmationDialog(
+            SettingsDisplay.wallpaperConsentTitle,
+            isPresented: Binding(get: { store.wallpaperConsentPending },
+                                 set: { if !$0 { store.cancelWallpaperConsent() } }),
+            titleVisibility: .visible
+        ) {
+            Button("换掉，并记住我原来那张") { store.confirmWallpaperConsent() }
+            Button("取消", role: .cancel) { store.cancelWallpaperConsent() }
+        } message: {
+            // `LocalizedStringKey`, not the bare `String`: `Text(someString)` does
+            // not parse markdown, and this body carries emphasis — it printed the
+            // asterisks verbatim in the one dialog that must read cleanly.
+            Text(LocalizedStringKey(SettingsDisplay.wallpaperConsentBody))
+        }
+    }
+}
+
+/// The screen the settings window quotes its numbers against.
+///
+/// `NSScreen.main` is the screen the key window is on, which is the one the user
+/// is looking at while dragging the slider. Deliberately *not* the same call the
+/// window controller uses to decide "which display is the main one" — that one is
+/// `CGMainDisplayID()`, because for a background app `NSScreen.main` follows
+/// whatever app is frontmost. Here it is only used for a preview and a "约 NNNpt"
+/// label, where following the user's gaze is the right answer.
+@MainActor
+private var previewDisplaySize: CGSize {
+    NSScreen.main?.frame.size ?? CGSize(width: 2560, height: 1440)
+}
+
+/// Desktop layer vs floating layer, each with the sentence that says what it
+/// actually costs. Two cards rather than a `Picker`: the two words on their own
+/// are meaningless to anybody who has not read the window-level dump, and this
+/// choice is the point of the whole round.
+private struct ModePicker: View {
+    let store: SettingsStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("形态").font(.callout.weight(.medium))
+            ForEach(AvatarLayerMode.allCases, id: \.self) { mode in
+                ModeCard(mode: mode, isSelected: store.avatar.mode == mode) {
+                    store.setAvatarMode(mode)
+                }
+            }
+        }
+    }
+}
+
+private struct ModeCard: View {
+    let mode: AvatarLayerMode
+    let isSelected: Bool
+    let select: () -> Void
+
+    var body: some View {
+        Button(action: select) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(SettingsDisplay.avatarModeHeadline(mode))
+                        .font(.body.weight(.medium))
+                    MarkdownText(SettingsDisplay.avatarModeExplanation(mode))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(isSelected ? Color.accentColor.opacity(0.10) : Color.clear))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(isSelected ? Color.accentColor.opacity(0.45)
+                                         : Color.secondary.opacity(0.25)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// Anchor grid + size slider + the live preview they both feed.
+private struct PlacementEditor: View {
+    let store: SettingsStore
+    @Binding var previewState: AvatarState
+    @Binding var showGroundingDetail: Bool
+
+    private var mode: AvatarLayerMode { store.avatar.mode }
+    private var placement: AvatarPlacement { store.avatar.current.placement }
+    private var boxHeight: CGFloat { placement.frame(inDisplayOfSize: previewDisplaySize).height }
+
+    private var heightBinding: Binding<Double> {
+        Binding(get: { Double(placement.heightFraction) },
+                set: { store.setAvatarHeightFraction(CGFloat($0)) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("位置").font(.callout.weight(.medium))
+                    AnchorGrid(selected: placement.anchor) { store.setAvatarAnchor($0) }
+                    if let note = SettingsDisplay.anchorNote(placement.anchor) {
+                        Text(note)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 200, alignment: .leading)
+                    }
+                }
+                Spacer(minLength: 0)
+                AvatarPreview(placement: placement, mode: mode, state: previewState)
+                    .frame(width: 230)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("大小").font(.callout.weight(.medium))
+                Slider(value: heightBinding,
+                       in: Double(SettingsDisplay.avatarHeightRange(mode).lowerBound)
+                           ... Double(SettingsDisplay.avatarHeightRange(mode).upperBound))
+                Text(SettingsDisplay.avatarHeightLabel(placement.heightFraction,
+                                                       displayHeight: previewDisplaySize.height))
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("桌面层与浮动层各记各的位置、大小和多显示器设置 —— 切回来还是你上次调的那个。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            // One state at a time on purpose: the four do not line up at the
+            // bottom, and letting the user flip between them is the only way to
+            // see that before choosing a size.
+            VStack(alignment: .leading, spacing: 4) {
+                Picker("预览状态", selection: $previewState) {
+                    ForEach(AvatarGrounding.previewStates, id: \.self) { state in
+                        Text(AvatarGrounding.stateName(state)).tag(state)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text(AvatarGrounding.gapLine(previewState, boxHeight: boxHeight))
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                DisclosureGroup("为什么各状态不一样高？", isExpanded: $showGroundingDetail) {
+                    MarkdownText(AvatarGrounding.caveat)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                }
+                .font(.caption2)
+            }
+        }
+    }
+}
+
+/// The nine anchors laid out where they sit on a screen.
+private struct AnchorGrid: View {
+    let selected: AvatarPlacement.Anchor
+    let select: (AvatarPlacement.Anchor) -> Void
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ForEach(Array(SettingsDisplay.anchorGrid.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: 4) {
+                    ForEach(row, id: \.self) { anchor in
+                        AnchorCell(anchor: anchor, isSelected: anchor == selected) {
+                            select(anchor)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(5)
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.25)))
+    }
+}
+
+private struct AnchorCell: View {
+    let anchor: AvatarPlacement.Anchor
+    let isSelected: Bool
+    let select: () -> Void
+
+    var body: some View {
+        Button(action: select) {
+            Text(SettingsDisplay.anchorName(anchor))
+                .font(.caption2)
+                .frame(width: 56, height: 30)
+                .background(RoundedRectangle(cornerRadius: 5)
+                    .fill(isSelected ? Color.accentColor.opacity(0.22)
+                                     : Color.secondary.opacity(0.08)))
+                .overlay(RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(isSelected ? Color.accentColor : Color.clear))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(SettingsDisplay.anchorName(anchor))
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// A schematic screen with her real geometry on it.
+///
+/// **The geometry is not a drawing.** The avatar box comes from
+/// `AvatarPlacement.frame(inDisplayOfSize:)` — the same function the window uses
+/// — computed at the real display size and then scaled down, so anchors and
+/// offsets are exactly what will happen. Her body inside that box comes from
+/// `AvatarGrounding`, i.e. the measured `anchors.json` boxes, which is why she
+/// visibly lifts off the bottom edge in 在听 and 在想. Only the silhouette itself
+/// is schematic, and it is drawn to fill the measured box exactly.
+private struct AvatarPreview: View {
+    let placement: AvatarPlacement
+    let mode: AvatarLayerMode
+    let state: AvatarState
+
+    var body: some View {
+        let display = previewDisplaySize
+        GeometryReader { geo in
+            let scale = display.width > 0 ? geo.size.width / display.width : 0
+            let box = flipped(placement.frame(inDisplayOfSize: display), in: display, scale: scale)
+            ZStack(alignment: .topLeading) {
+                wallpaper
+                menuBar(width: geo.size.width)
+                desktopIcons(in: geo.size)
+
+                // Draw order *is* the explanation: on the desktop layer the mock
+                // window goes over her, on the floating layer it goes under.
+                if mode == .floating { mockWindow(in: geo.size) }
+                figure(in: box)
+                if mode == .desktop { mockWindow(in: geo.size) }
+
+                clipFrame(box)
+                idleBaseline(box)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.35)))
+        }
+        .aspectRatio(display.height > 0 ? display.width / display.height : 16.0 / 9.0,
+                     contentMode: .fit)
+    }
+
+    /// `AvatarPlacement` works bottom-left (unflipped `NSView`); SwiftUI is
+    /// top-left.
+    private func flipped(_ rect: CGRect, in size: CGSize, scale: CGFloat) -> CGRect {
+        CGRect(x: rect.minX * scale,
+               y: (size.height - rect.maxY) * scale,
+               width: rect.width * scale,
+               height: rect.height * scale)
+    }
+
+    private var wallpaper: some View {
+        LinearGradient(colors: [Color(red: 0.16, green: 0.18, blue: 0.26),
+                                Color(red: 0.30, green: 0.24, blue: 0.34)],
+                       startPoint: .top, endPoint: .bottom)
+    }
+
+    private func menuBar(width: CGFloat) -> some View {
+        Rectangle().fill(Color.white.opacity(0.16)).frame(width: width, height: 6)
+    }
+
+    private func desktopIcons(in size: CGSize) -> some View {
+        VStack(spacing: 4) {
+            ForEach(0..<2, id: \.self) { _ in
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.white.opacity(0.22))
+                    .frame(width: 9, height: 9)
+            }
+        }
+        .position(x: size.width - 12, y: 24)
+    }
+
+    /// A stand-in for "the user is working".
+    ///
+    /// Two things about it are load-bearing. It is big enough to reach every
+    /// anchor — a window that stopped short of the corner she is in would show
+    /// the desktop layer *not* being covered, which is the opposite of the
+    /// point. And it is fully opaque, with a title bar, so that where it covers
+    /// her there is nothing left to see; a translucent rectangle over a pale
+    /// silhouette reads as "still visible".
+    private func mockWindow(in size: CGSize) -> some View {
+        let width = size.width * 0.84
+        let height = size.height * 0.70
+        return VStack(spacing: 0) {
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Color(white: 0.86))
+                HStack(spacing: 3) {
+                    ForEach(0..<3, id: \.self) { _ in
+                        Circle().fill(Color(white: 0.62)).frame(width: 3, height: 3)
+                    }
+                }
+                .padding(.leading, 5)
+            }
+            .frame(height: 9)
+            Rectangle().fill(Color(white: 0.96))
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.black.opacity(0.20)))
+        .position(x: size.width * 0.5, y: size.height * 0.56)
+    }
+
+    /// The clip's own frame — the 810x1080 box the video is drawn into. Dashed and
+    /// faint, so the empty space under her body reads as part of the footage
+    /// rather than as a layout mistake.
+    private func clipFrame(_ box: CGRect) -> some View {
+        RoundedRectangle(cornerRadius: 2)
+            .strokeBorder(Color.white.opacity(0.35),
+                          style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            .frame(width: box.width, height: box.height)
+            .offset(x: box.minX, y: box.minY)
+    }
+
+    /// Where `idle` ends, so the lift in the other states has something to be
+    /// measured against.
+    private func idleBaseline(_ box: CGRect) -> some View {
+        let idleBottom = AvatarGrounding.box(.idle).map { idle in
+            box.minY + box.height * ((idle.y + idle.height) / AvatarBodyBox.canvas.height)
+        }
+        return Rectangle()
+            .fill(Color.accentColor.opacity(idleBottom == nil ? 0 : 0.7))
+            .frame(width: box.width, height: 1)
+            .offset(x: box.minX, y: (idleBottom ?? 0) - 0.5)
+    }
+
+    @ViewBuilder
+    private func figure(in box: CGRect) -> some View {
+        if let body = AvatarGrounding.box(state) {
+            let normalized = body.normalized()
+            let rect = CGRect(x: box.minX + box.width * normalized.minX,
+                              y: box.minY + box.height * normalized.minY,
+                              width: box.width * normalized.width,
+                              height: box.height * normalized.height)
+            let head = min(rect.width * 0.46, rect.height * 0.30)
+            ZStack(alignment: .topLeading) {
+                Circle()
+                    .fill(Color.white.opacity(0.82))
+                    .frame(width: head, height: head)
+                    .offset(x: rect.midX - head / 2, y: rect.minY)
+                RoundedRectangle(cornerRadius: rect.width * 0.30)
+                    .fill(Color.white.opacity(0.82))
+                    .frame(width: rect.width * 0.92,
+                           height: max(rect.height - head * 0.82, 1))
+                    .offset(x: rect.midX - rect.width * 0.46,
+                            y: rect.minY + head * 0.82)
+            }
+        }
+    }
+}
+
+/// Per mode, because the two want different answers: two always-on-top
+/// companions on a two-panel desk is twice the interruption, while two desktop
+/// ones cost nothing but decoding.
+private struct DisplayScopePicker: View {
+    let store: SettingsStore
+
+    private var selection: Binding<AvatarDisplayScope> {
+        Binding(get: { store.avatar.current.displayScope },
+                set: { store.setAvatarDisplayScope($0) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("多显示器").font(.callout.weight(.medium))
+            Picker("多显示器", selection: selection) {
+                ForEach(AvatarDisplayScope.allCases, id: \.self) { scope in
+                    Text(SettingsDisplay.avatarScopeName(scope)).tag(scope)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 260)
+            Text(SettingsDisplay.avatarScopeExplanation(store.avatar.current.displayScope,
+                                                        mode: store.avatar.mode))
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct WallpaperControls: View {
+    let store: SettingsStore
+
+    private var toggle: Binding<Bool> {
+        // Reads the stored value, never the pending one: while consent is on
+        // screen the switch stays off, so cancelling leaves the desktop alone and
+        // the switch honest about it.
+        Binding(get: { store.avatar.wallpaperEnabled },
+                set: { store.setWallpaperEnabled($0) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("配套壁纸").font(.callout.weight(.medium))
+            Toggle("启动时应用配套壁纸", isOn: toggle)
+            Text(SettingsDisplay.wallpaperStatusLine(
+                enabled: store.avatar.wallpaperEnabled,
+                canRestore: store.canRestoreWallpaper,
+                replaced: store.hasReplacedWallpaper,
+                wired: store.isWallpaperWired))
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("恢复我原来的壁纸") { store.restoreOriginalWallpaper() }
+                    .disabled(!store.canRestoreWallpaper)
+                Spacer()
+            }
+        }
     }
 }

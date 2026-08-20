@@ -188,6 +188,22 @@ final class SettingsStore {
     /// explanation actually reached anybody. See `FirstRunOnboarding`.
     var onOnboardingDismissed: (() -> Void)?
 
+    // MARK: - Avatar
+
+    /// Which layer she is drawn on, where she sits, how big she is, and whether
+    /// the bundled wallpaper is in play. Persisted in `UserDefaults`; handed to
+    /// whoever owns the windows through `onAvatarSettingsChanged`.
+    private(set) var avatar: AvatarSettings
+
+    /// True while the wallpaper switch is waiting for the one-time "yes, you may
+    /// replace my desktop picture". The switch itself stays **off** until the
+    /// answer arrives, so a mis-click cannot change the desktop.
+    private(set) var wallpaperConsentPending = false
+
+    /// Fires on every accepted change and never at construction time: the caller
+    /// reads `avatar` once when it wires itself up, and this is only the delta.
+    var onAvatarSettingsChanged: ((AvatarSettings) -> Void)?
+
     func presentOnboarding(_ text: FirstRunOnboardingText) {
         onboarding = text
     }
@@ -222,14 +238,27 @@ final class SettingsStore {
     private var graceTask: Task<Void, Never>?
     private var watchdogs: [String: Task<Void, Never>] = [:]
 
+    /// Where the avatar settings live between launches.
+    private let avatarDefaults: UserDefaults
+
+    /// The desktop picture. Optional because it is the one thing in this window
+    /// that reaches outside the app, and a test must never be handed the real
+    /// one — see `WallpaperControlling`.
+    private let wallpaper: (any WallpaperControlling)?
+
     init(store: any CredentialStore = KeychainCredentialStore(),
          envReader: any EnvFileReading = EnvFileReader(),
          keychainDataProtection: Bool = KeychainCredentialStore.dataProtectionAvailable,
+         avatarDefaults: UserDefaults = .standard,
+         wallpaper: (any WallpaperControlling)? = nil,
          probeGrace: Duration = .seconds(3),
          probeTimeout: Duration = .seconds(20)) {
         self.store = store
         self.envReader = envReader
         self.keychainDataProtection = keychainDataProtection
+        self.avatarDefaults = avatarDefaults
+        self.wallpaper = wallpaper
+        self.avatar = AvatarSettingsDefaults.load(from: avatarDefaults)
         self.probeGrace = probeGrace
         self.probeTimeout = probeTimeout
         refreshRows()
@@ -574,5 +603,222 @@ final class SettingsStore {
             return "\(SettingsDisplay.providerName(result.provider)) \(status)"
         }
         return "\(name)：\(parts.joined(separator: "，"))"
+    }
+}
+
+// MARK: - Avatar settings
+
+/// Everything the 形象 section owns.
+///
+/// `presentation` is not a translation of anything — it is exactly the value
+/// `DesktopWindowController.presentation` takes, so the settings window's job is
+/// to edit it and hand it over. The two wallpaper flags are this window's own,
+/// because the desktop picture is not something the window controller touches.
+struct AvatarSettings: Equatable {
+    var presentation = AvatarPresentation.default
+    /// Apply the bundled wallpaper at launch.
+    var wallpaperEnabled = false
+    /// The user has been told, once, that turning the switch on replaces their
+    /// desktop picture — and said yes. Remembered so the question is asked once,
+    /// never so it can be skipped.
+    var wallpaperConsented = false
+
+    static let `default` = AvatarSettings()
+
+    var mode: AvatarLayerMode { presentation.mode }
+
+    /// The placement and display scope of the mode that is live.
+    var current: AvatarLayerSettings { presentation.active }
+}
+
+/// Read/write of `AvatarSettings` in `UserDefaults`.
+///
+/// `AvatarPresentation` goes in as one JSON blob: it is `Codable` and, more to
+/// the point, its `init(from:)` defaults every *missing* member rather than
+/// failing, so a value written by an older build still loads. What it does not
+/// survive is a member that is present but nonsense (an anchor name this build
+/// never had) — `Decodable` throws on that — so the whole read is wrapped and a
+/// broken blob falls back to the defaults instead of taking the window down.
+enum AvatarSettingsDefaults {
+    private enum Key {
+        static let presentation = "avatar.presentation"
+        static let wallpaperEnabled = "avatar.wallpaper.enabled"
+        static let wallpaperConsented = "avatar.wallpaper.consented"
+    }
+
+    static func load(from defaults: UserDefaults) -> AvatarSettings {
+        var settings = AvatarSettings.default
+        if let data = defaults.data(forKey: Key.presentation) {
+            do {
+                settings.presentation = try JSONDecoder().decode(AvatarPresentation.self, from: data)
+            } catch {
+                settingsLog.warning("""
+                    stored avatar presentation could not be read, falling back to the defaults: \
+                    \(error.localizedDescription, privacy: .public)
+                    """)
+            }
+        }
+        // `object(forKey:)` rather than `bool(forKey:)`: absent has to mean "the
+        // default", and for consent the default is a firm no.
+        if defaults.object(forKey: Key.wallpaperEnabled) != nil {
+            settings.wallpaperEnabled = defaults.bool(forKey: Key.wallpaperEnabled)
+        }
+        if defaults.object(forKey: Key.wallpaperConsented) != nil {
+            settings.wallpaperConsented = defaults.bool(forKey: Key.wallpaperConsented)
+        }
+        return settings
+    }
+
+    static func save(_ settings: AvatarSettings, to defaults: UserDefaults) {
+        if let data = try? JSONEncoder().encode(settings.presentation) {
+            defaults.set(data, forKey: Key.presentation)
+        }
+        defaults.set(settings.wallpaperEnabled, forKey: Key.wallpaperEnabled)
+        defaults.set(settings.wallpaperConsented, forKey: Key.wallpaperConsented)
+    }
+}
+
+// MARK: - Wallpaper
+
+/// The desktop picture, as the settings window needs it.
+///
+/// **Placeholder for the module being written in parallel** (`Wallpaper.swift`).
+/// It is a protocol rather than a direct call for the same reason
+/// `CredentialStore` is: a unit test must not be able to repaint the developer's
+/// actual desktop, and this is the seam where the fake goes in. `hasBackup` is
+/// the one piece of state the window has to read back — "恢复我原来的壁纸" must
+/// be dead when there is nothing to restore, not fail after being pressed.
+@MainActor
+protocol WallpaperControlling: AnyObject {
+    /// `restoreOriginal()` would actually put the user's wallpaper back.
+    ///
+    /// Strictly stronger than "a backup exists": a backup taken over a dynamic
+    /// wallpaper records what the API *reported*, which is a placeholder file
+    /// with nothing to do with what was on screen. Restoring from it is not a
+    /// restore, so it must not be offered — see `hasReplacedWallpaper`.
+    var hasBackup: Bool { get }
+    /// akari has replaced the desktop picture and remembers doing so — whether
+    /// or not it can put the old one back. The difference between this and
+    /// `hasBackup` is the one case the window must not lie about: the desktop
+    /// *is* akari's now, and there is no way back through this app.
+    var hasReplacedWallpaper: Bool { get }
+    /// Remember the current wallpaper (once), then set the bundled one.
+    func applyBundledWallpaper() throws
+    /// Put back what was there before akari first touched it.
+    func restoreOriginal() throws
+}
+
+// MARK: - Avatar mutations
+
+extension SettingsStore {
+    func setAvatarMode(_ mode: AvatarLayerMode) {
+        updateAvatar { $0.presentation.mode = mode }
+    }
+
+    /// Every placement edit applies to whichever mode is selected — the two are
+    /// remembered separately (`AvatarPresentation.subscript`).
+    func setAvatarAnchor(_ anchor: AvatarPlacement.Anchor) {
+        updateAvatar { $0.presentation[$0.presentation.mode].placement.anchor = anchor }
+    }
+
+    func setAvatarHeightFraction(_ fraction: CGFloat) {
+        // Clamped here as well as in `AvatarPlacement.frame`, so what is stored
+        // and shown is what will actually happen rather than a number the window
+        // silently corrects on the way to the screen.
+        let clamped = min(max(fraction, AvatarPlacement.heightFractionRange.lowerBound),
+                          AvatarPlacement.heightFractionRange.upperBound)
+        updateAvatar { $0.presentation[$0.presentation.mode].placement.heightFraction = clamped }
+    }
+
+    func setAvatarDisplayScope(_ scope: AvatarDisplayScope) {
+        updateAvatar { $0.presentation[$0.presentation.mode].displayScope = scope }
+    }
+
+    /// Turning it **on** costs the user their current desktop picture, so the
+    /// first time it goes through consent instead of through here.
+    func setWallpaperEnabled(_ enabled: Bool) {
+        guard enabled else {
+            wallpaperConsentPending = false
+            updateAvatar { $0.wallpaperEnabled = false }
+            notice = "以后启动不会再换壁纸。现在这张不会自己变回去 —— 要换回来请按「恢复我原来的壁纸」。"
+            return
+        }
+        guard avatar.wallpaperConsented else {
+            wallpaperConsentPending = true
+            return
+        }
+        applyWallpaper()
+    }
+
+    func confirmWallpaperConsent() {
+        guard wallpaperConsentPending else { return }
+        wallpaperConsentPending = false
+        updateAvatar { $0.wallpaperConsented = true }
+        applyWallpaper()
+    }
+
+    func cancelWallpaperConsent() {
+        wallpaperConsentPending = false
+    }
+
+    /// True when there is something to put back. False also covers "the wallpaper
+    /// module is not wired up in this build" and "akari did change the desktop,
+    /// but what it replaced was a dynamic wallpaper it cannot set again".
+    var canRestoreWallpaper: Bool { wallpaper?.hasBackup ?? false }
+
+    /// akari's artwork is on the desktop right now as far as this app knows.
+    /// Read together with `canRestoreWallpaper` it separates "nothing happened"
+    /// from "it happened and cannot be undone here".
+    var hasReplacedWallpaper: Bool { wallpaper?.hasReplacedWallpaper ?? false }
+
+    var isWallpaperWired: Bool { wallpaper != nil }
+
+    func restoreOriginalWallpaper() {
+        guard let wallpaper else {
+            notice = "壁纸功能还没接上，这个按钮现在什么也做不了。"
+            return
+        }
+        guard wallpaper.hasBackup else {
+            notice = wallpaper.hasReplacedWallpaper
+                ? WallpaperError.restoreNotPossible.localizedDescription
+                : "没有可恢复的壁纸：akari 还没有换过你的桌面。"
+            return
+        }
+        do {
+            try wallpaper.restoreOriginal()
+        } catch {
+            notice = "恢复壁纸失败：\(error.localizedDescription)"
+            return
+        }
+        updateAvatar { $0.wallpaperEnabled = false }
+        notice = "已换回你原来的壁纸，并关掉了「启动时应用」。"
+    }
+
+    /// Applied right now, not only at the next launch: flipping a switch that
+    /// says it changes the wallpaper and seeing nothing happen is
+    /// indistinguishable from a broken switch.
+    private func applyWallpaper() {
+        guard let wallpaper else {
+            updateAvatar { $0.wallpaperEnabled = true }
+            notice = "已记下这个偏好。壁纸功能在这份构建里还没接上，所以桌面没有真的改变。"
+            return
+        }
+        do {
+            try wallpaper.applyBundledWallpaper()
+        } catch {
+            notice = "换壁纸失败：\(error.localizedDescription)"
+            return
+        }
+        updateAvatar { $0.wallpaperEnabled = true }
+        notice = "已换成配套壁纸，你原来那张已经备份，随时可以按下面的按钮换回去。"
+    }
+
+    private func updateAvatar(_ mutate: (inout AvatarSettings) -> Void) {
+        var next = avatar
+        mutate(&next)
+        guard next != avatar else { return }
+        avatar = next
+        AvatarSettingsDefaults.save(next, to: avatarDefaults)
+        onAvatarSettingsChanged?(next)
     }
 }

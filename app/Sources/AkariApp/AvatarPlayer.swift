@@ -27,11 +27,34 @@ private extension AvatarState {
 /// resize its sublayers, and the desktop windows are re-framed on every display
 /// arrangement change.
 private final class AvatarRootLayer: CALayer {
+    /// Per-sublayer downward shift, as a fraction of the layer's height.
+    ///
+    /// The clips do not share where she sits inside their canvas: normalisation
+    /// aligns her FACE across states (so she does not jump when the state changes),
+    /// and because the states have different body lengths, aligning faces leaves
+    /// different amounts of empty canvas under her — 1px in `idle` but 111px in
+    /// `listening`. Rendering every clip flush to the window would leave her
+    /// hovering in exactly those states.
+    ///
+    /// Face-alignment and bottom-alignment cannot both hold while body lengths
+    /// differ; this shifts each clip down by its own gap so the bottom wins, and
+    /// pays for it with up to ~60pt of face movement between states. A person
+    /// shifting posture moves their head anyway; a person floating off the floor
+    /// reads as broken.
+    var bottomShift: [ObjectIdentifier: CGFloat] = [:] {
+        didSet { setNeedsLayout() }
+    }
+
     override func layoutSublayers() {
         super.layoutSublayers()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for sublayer in sublayers ?? [] { sublayer.frame = bounds }
+        for sublayer in sublayers ?? [] {
+            let shift = bottomShift[ObjectIdentifier(sublayer)] ?? 0
+            // Layer coordinates are bottom-left origin here (the hosting view is
+            // unflipped), so moving her down means lowering y.
+            sublayer.frame = bounds.offsetBy(dx: 0, dy: -bounds.height * shift)
+        }
         CATransaction.commit()
     }
 }
@@ -125,6 +148,9 @@ final class AvatarPlayer {
     /// Layer to hand to a `DesktopWindow`. Holds both player layers.
     let rootLayer: CALayer
 
+    /// Same object as `rootLayer`, typed so the per-clip bottom shift can be set.
+    private let root: AvatarRootLayer
+
     private(set) var state: AvatarState = .idle
 
     /// Clip currently visible. Exposed for tests: `state` is set the moment a
@@ -145,6 +171,18 @@ final class AvatarPlayer {
     /// How long to wait for the incoming decoder before dissolving anyway. Fading
     /// into a layer with no frames yet shows the desktop through her.
     private static let readinessTimeout: Duration = .milliseconds(250)
+
+    /// Clip file name -> how far to shift it down, as a fraction of its height.
+    ///
+    /// Read from `anchors.json`, which `tools/anchor` writes next to the clips: it
+    /// carries the union of her alpha bounding box across every frame, so the empty
+    /// canvas beneath her is `canvasHeight - (boxY + boxHeight)`. Shifting by that
+    /// fraction puts her feet on the window's bottom edge whichever state is playing.
+    ///
+    /// Absent or unreadable manifest means no shift — the clips still play, she just
+    /// sits wherever the footage put her. Never an error: a missing manifest must not
+    /// cost the user her presence on the desktop.
+    private var bottomShiftByFile: [String: CGFloat] = [:]
 
     private var front = AvatarSide()
     private var back = AvatarSide()
@@ -171,6 +209,30 @@ final class AvatarPlayer {
     /// unregister. Only ever touched on the main actor plus that one final read.
     private nonisolated(unsafe) var endObserver: (any NSObjectProtocol)?
 
+    /// Decode `anchors.json` into per-clip bottom shifts. Best effort by design.
+    private static func loadBottomShifts(in directory: URL) -> [String: CGFloat] {
+        struct Manifest: Decodable {
+            struct Clip: Decodable {
+                let file: String
+                let canvasHeight: Int
+                let boxY: Int
+                let boxHeight: Int
+            }
+            let clips: [Clip]
+        }
+        guard let data = try? Data(contentsOf: directory.appending(path: "anchors.json")),
+              let manifest = try? JSONDecoder().decode(Manifest.self, from: data) else {
+            return [:]
+        }
+        var shifts: [String: CGFloat] = [:]
+        for clip in manifest.clips where clip.canvasHeight > 0 {
+            let gap = clip.canvasHeight - (clip.boxY + clip.boxHeight)
+            guard gap > 0 else { continue }
+            shifts[clip.file] = CGFloat(gap) / CGFloat(clip.canvasHeight)
+        }
+        return shifts
+    }
+
     init(assetDirectory: URL) {
         self.assetDirectory = assetDirectory
         let root = AvatarRootLayer()
@@ -179,6 +241,8 @@ final class AvatarPlayer {
         root.addSublayer(front.layer)
         root.addSublayer(back.layer)
         self.rootLayer = root
+        self.root = root
+        self.bottomShiftByFile = Self.loadBottomShifts(in: assetDirectory)
     }
 
     deinit {
@@ -227,8 +291,32 @@ final class AvatarPlayer {
 
     // MARK: Transitions
 
+    /// How long the cross-fade into `state` should take when the core does not say.
+    ///
+    /// One value for every transition was wrong in both directions. The original
+    /// 0.12s comes from spec.md's "3-5 frame dissolve", whose job is to *hide* the
+    /// posture discontinuity between two clips — at 30fps it is under four frames,
+    /// so nobody sees a transition at all. But simply making it longer hurts the one
+    /// transition that must feel instant.
+    ///
+    /// So it is graded by what the change means to the person watching:
+    ///   - `listening` answers a key press. Anything slow reads as "it didn't hear me".
+    ///   - `talking` is her opening her mouth; a beat of ceremony suits it.
+    ///   - `idle` is the wind-down after an answer. Nothing is waiting on it, and a
+    ///     slow settle is what a person does when a conversation pauses.
+    static func defaultDuration(to state: AvatarState) -> TimeInterval {
+        switch state {
+        case .listening: 0.18
+        case .thinking:  0.25
+        case .talking:   0.30
+        case .greeting:  0.30
+        case .idle:      0.50
+        }
+    }
+
     /// Cross-fade to `state`. Called on every `avatar.setState` control message.
-    func transition(to newState: AvatarState, duration: TimeInterval = 0.12) {
+    func transition(to newState: AvatarState, duration: TimeInterval? = nil) {
+        let duration = duration ?? Self.defaultDuration(to: newState)
         guard let url = resolvedClips[newState] else {
             avatarWarn("transition to \(newState.rawValue) ignored: preload() has not resolved any clip")
             return
@@ -271,6 +359,10 @@ final class AvatarPlayer {
         front.layer.zPosition = 0
         CATransaction.commit()
 
+        // Register the shift before loading so the first laid-out frame is already
+        // in the right place — setting it afterwards would show one frame of her
+        // hovering before it snapped down.
+        root.bottomShift[ObjectIdentifier(back.layer)] = bottomShiftByFile[url.lastPathComponent] ?? 0
         back.load(url, oneShot: oneShot)
         if oneShot { installEndObserver(target: newState, generation: gen) }
 

@@ -92,6 +92,9 @@ app-bundle: build-app
 	@# 形象素材随包走，这样 .app 拷到别处也能找到片子（AppDelegate 先看
 	@# Contents/Resources/akari，再退回 <repo>/assets/akari）。
 	@if [ -d $(ROOT)/assets/akari ]; then cp -R $(ROOT)/assets/akari $(BUNDLE)/Contents/Resources/akari; fi
+	@# 配套壁纸同理，但它是可选的：缺了不影响启动 —— WallpaperController 会
+	@# 报「找不到配套壁纸」并把桌面原样留给用户（Wallpaper.swift）。
+	@if [ -d $(ROOT)/assets/brand/wallpaper ]; then cp -R $(ROOT)/assets/brand/wallpaper $(BUNDLE)/Contents/Resources/wallpaper; fi
 	@# core 也随包走，而且这一条是安全要求不是便利：发布版只肯执行
 	@# Contents/Resources/core，绝不向上搜目录找 core/package.json —— .app
 	@# 旁边的目录是谁放的谁说了算（CoreProcess.resolveCoreDirectory）。

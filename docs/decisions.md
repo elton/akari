@@ -929,3 +929,132 @@ local 组按设置界面的需要做了 `LocalTextProvider.warmup()`（唯一能
 `FakeRealtime` 是本机 loopback、不碰网络，最可能是机器忙时前一个用例
 `server.stop()` 释放的临时端口与下一个用例的 `port: 0` 撞上。
 是测试设施的竞态，不是产品代码；本轮没有修，记在这里以免下次被当成新问题。
+
+---
+
+## ADR-011 · 形象有两种形态：桌面层与浮动层，各自记住自己的位置
+
+**背景（用户实测后提出的）**：桌面层（`.desktopIconWindow - 1`，夹在壁纸与桌面图标之间）
+意味着**任何窗口都盖在她上面**。屏幕被窗口占满时她等于不存在 —— 而「AI 伴侣」的价值
+恰恰在陪伴感。这个取舍当初没被摆上台面讨论过。
+
+**决定**：不二选一，把取舍交给用户。两种形态，各自记各自的位置、大小、多显示器设置。
+
+### 1. 浮动层选 `.floating`（3）
+
+本机（macOS 26.6.1 / M4 Max / 两台 5K）从**外部进程** dump
+`CGWindowListCopyWindowInfo` 量到的层级梯子：
+
+| 层 | 是谁 |
+| --- | --- |
+| 0 | 普通窗口（Chrome / IDEA / 访达…） |
+| **3** | **`.floating` —— 我们** |
+| 8 | 别的 App 自己钉的置顶面板 |
+| 20 | Dock |
+| 24 | 菜单栏 |
+| 25 | 状态项 / 控制中心 |
+| 1000 | `.screenSaver`（**不是**流传的 101） |
+
+选 3 的理由：**还能盖住所有普通窗口的最低一档**。`.statusBar`(25) 会盖住菜单栏和通知横幅，
+`.screenSaver`(1000) 会盖住锁屏/屏保 —— 为不需要的好处付真实退化。
+接受的代价：用户自己钉的置顶面板（层 8）会盖住她，这是对的，用户主动钉的东西该赢。
+
+### 2. 全屏 App：`.fullScreenAuxiliary`，`.fullScreenNone` 是错的
+
+两个**独立进程**采样 onscreen 窗口列表测出来的：
+
+| collectionBehavior | 全屏空间激活后 |
+| --- | --- |
+| `[.canJoinAllSpaces, .ignoresCycle, .fullScreenAuxiliary]` | 在屏，且排在全屏窗口前面 |
+| `[.canJoinAllSpaces, .ignoresCycle]` | 同上 |
+| `[.canJoinAllSpaces, .ignoresCycle, .fullScreenNone]` | **整个从屏幕上消失** |
+
+集成轮补了一次**真 App bundle**（文本编辑，`AXFullScreen = true`）的复核：
+全屏窗口在层 0 铺满 2560×1440，akari 两块屏的窗口仍在层 3 且排在它前面。
+桌面层保留 `.fullScreenNone`（跟着桌面一起消失是对的）。
+**仍未测**：独占显示的全屏游戏。
+
+### 3. 点击穿透与焦点
+
+两种形态都显式 `ignoresMouseEvents = true`，不依赖「透明像素自动穿透」
+（那条只有 medium 置信度且有混淆变量）。`canBecomeKey/Main` 都是 false。
+**没有**改成 `NSPanel/.nonactivatingPanel`：一个鼠标事件都不收时非激活面板买不到任何东西，
+而 `NSPanel.hidesOnDeactivate` 默认 true，对后台 App 是「她永远不出现」的陷阱。
+
+集成轮实测：浮动窗口覆盖区域内三个点做 `AXUIElementCopyElementAtPosition`
+命中测试，返回的都是**下面那个 App**（Google Chrome），没有一次落到 akari 上。
+
+### 4. 浮动窗口只有她那么大
+
+浮动形态下窗口 = 她的框（默认 324×432），不是整屏透明窗 —— 整屏透明窗浮在层 3
+会变成截图取景框和窗口管理器眼里的一块巨大幽灵窗，没有任何收益。
+几何算在纯函数 `AvatarGeometry.frames(mode:placement:screenFrame:)` 里，可无屏测试。
+
+### 5. 代价：浮动形态下省电门基本失效
+
+桌面层的窗口大部分时间被别的窗口遮住，`RenderGate` 会把播放器暂停到 0.07% CPU。
+浮动层在层 3，**几乎永远不会被遮住**，所以她一直在解码。
+本机粗测（app 进程整体）：浮动单屏 2.2–3.5%，浮动两屏 5–6%。
+这是选浮动形态要付的电费，设置界面里写明了。
+
+### 6. 拖动：本轮不做
+
+拖动与点击穿透是同一个开关。留好的口：`DesktopWindowController.presentation`
+可实时赋值，任何拖动实现只需把拖到的点换算回 `anchor` + `offset` 再赋值。
+
+---
+
+## 壁纸能力的真实边界（macOS 26.6.2 实测）
+
+**结论：第三方 App 不能设置动态壁纸。** 能做到的最好是一张静态图，
+外加 akari 自己按浅色/深色换图。要动的东西只能画在她已经在用的桌面层窗口上。
+
+三条独立证据：
+
+| 证据 | 结果 |
+| --- | --- |
+| 拿系统自带的双图 HEIC（带 `apple_desktop:apr` 浅/深配对元数据）走 `setDesktopImageURL`，再切深色模式 | 抓 Dock 的 `Wallpaper-<UUID>` 窗口，浅色与深色两张截图**逐通道最大差 0.0** |
+| 看 API 写进系统壁纸库的记录 | `Provider = com.apple.wallpaper.choice.image`、`Configuration = {type: imageFile, url: …}`，**没有任何 dynamic/appearance 选项** |
+| 视频壁纸（航拍） | 是另一个 provider `com.apple.wallpaper.choice.aerials`，公开 API 里没有入口；`WallpaperExtensionKit` 是私有框架 |
+
+### 比「不能动」更要紧的一条：`desktopImageURL` 会说谎
+
+壁纸不是图片文件时，`NSWorkspace.desktopImageURL(for:)` 对两块屏都返回
+`/System/Library/CoreServices/DefaultDesktop.heic` —— 一个和屏幕上完全无关的文件。
+天真实现会把这个假路径备份下来，然后「恢复原壁纸」时装上一张错的图并报告成功。
+
+所以有 `WallpaperStoreProbe`：**只读**系统壁纸库
+（`~/Library/Application Support/com.apple.wallpaper/Store/Index.plist`）判断被替换的
+到底是不是图片文件。不是的话第一次开开关会**先拒绝一次并说明**，再点一次才换。
+
+集成轮在本机（用户当时正用航拍视频壁纸）真跑了三次：
+
+1. 只读探测 → `notAnImage(provider: com.apple.wallpaper.choice.aerials)`，
+   第一次 `applyBundledWallpaper()` 抛 `originalNotRestorable`，**桌面一个字节没动**。
+2. 临时把桌面换成一张普通图片（`Solid Colors/Blue Violet.png`）之后，
+   `applyBundledWallpaper()` → 两块屏 `desktopImageURL` 读回都是
+   `akari-wallpaper-5120x2880.png`；`restoreOriginal()` → 两块屏读回都是 Blue Violet。
+   **设置与恢复都是真的。**
+3. 用户原来的航拍壁纸已还原：`Index.plist` 回到实测前的**字节状态**
+   （sha 一致，provider 是 aerials），并抓 Dock 的 Wallpaper 窗口目视确认画面回来了。
+   还原方式是先备份 `Index.plist`，然后 `killall -9 WallpaperAgent` → 拷回 → 再 `killall -9`
+   （先拷后 kill 无效，进程退出时会把内存里的旧状态刷回去覆盖）。
+   这条路子有效，但**没有写进产品代码** —— 那是活守护进程独占的未公开文件，
+   写坏了会丢掉用户整套壁纸配置，比不提供恢复更糟。
+
+### 因此改掉的一条（集成轮发现）
+
+`hasBackup` 原本是 `backup != nil`，于是替换动态壁纸之后设置界面会说
+「你原来那张已经备份，随时可以换回去」并且**把「恢复我原来的壁纸」按钮点亮** ——
+而那个备份记的是上面那个假路径，按下去只会稳定报错。
+现在 `hasBackup` 是 `backup?.faithful == true`（能真恢复才算），
+另加 `hasReplacedWallpaper`（换过、但换不回来）撑起第三种状态，界面照实说
+「akari 恢复不了，请去系统设置重新选一次」。
+
+### 配套壁纸的素材不进 git
+
+一张 5K PNG 就有 16MB，三个分辨率合计 35MB —— 和这个仓库不收 `*.mov` 是同一条理由。
+命名与放置约定写在 `assets/brand/README.md`；缺图不致命，
+`WallpaperController` 会报「找不到配套壁纸」并把桌面原样留给用户。
+（另：三个文件里只有 5120×2880 那张会被选中，`WallpaperCatalog.rank` 按「像素数最接近母版」
+排序，另外两张任何显示器上都轮不到。）
