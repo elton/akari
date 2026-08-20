@@ -31,3 +31,7 @@ models/
 # Keyframe stills DO belong in the repo — they are the source of truth for
 # regenerating any clip, and they are small. Only the rendered video is excluded.
 !assets/akari/keyframes/*.png
+
+# Brand assets are small and are the source of truth for the app icon.
+!assets/brand/*.png
+!assets/brand/*.icns

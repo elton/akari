@@ -81,9 +81,14 @@ app-bundle: build-app
 	  '  <key>CFBundleVersion</key><string>1</string>' \
 	  '  <key>LSMinimumSystemVersion</key><string>26.0</string>' \
 	  '  <key>LSUIElement</key><true/>' \
+	  '  <key>CFBundleIconFile</key><string>AppIcon</string>' \
 	  '  <key>NSMicrophoneUsageDescription</key><string>akari 需要麦克风来听你说话。</string>' \
 	  '</dict></plist>' \
 	  > $(BUNDLE)/Contents/Info.plist
+	@# The icon is full-bleed square on purpose: macOS applies its own rounding to
+	@# the tile, so a pre-rounded artwork would be rounded twice and show a pale
+	@# seam at the corners.
+	@if [ -f $(ROOT)/assets/brand/AppIcon.icns ]; then cp $(ROOT)/assets/brand/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns; fi
 	@# 形象素材随包走，这样 .app 拷到别处也能找到片子（AppDelegate 先看
 	@# Contents/Resources/akari，再退回 <repo>/assets/akari）。
 	@if [ -d $(ROOT)/assets/akari ]; then cp -R $(ROOT)/assets/akari $(BUNDLE)/Contents/Resources/akari; fi
