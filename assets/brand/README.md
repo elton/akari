@@ -63,21 +63,17 @@ iconutil -c icns $ICON -o assets/brand/AppIcon.icns
 但会在日志里说一声「放大后会发虚」。`.heic` 排在最前 —— 同一张图约 1/3 的字节数，
 而且是硬件解码。
 
-**这些文件不进 git**（见 `.gitignore` 里那段）：一张 5K PNG 就有 16MB，
-和这个仓库不收 `*.mov` 是同一条理由。缺图不致命 —— `WallpaperController` 会报
-「找不到配套壁纸」，桌面原样留给用户。要用就把图放进上面那个目录，
-或者用 `AKARI_WALLPAPER_DIR` 指到别处。
+**成品壁纸随代码走，PNG 母版不进 git** —— 理由与取舍见下一节。
+缺图不致命 —— `WallpaperController` 会报「找不到配套壁纸」，桌面原样留给用户。
+要换成自己的图，放进上面那个目录，或者用 `AKARI_WALLPAPER_DIR` 指到别处。
 
-
----
-
-## 配套壁纸
+### 当前这张
 
 `wallpaper/akari-wallpaper-5120x2880.heic` —— 深夜湖面与一弯暖月。
 构图刻意把视觉重心压在左侧与上方，**右下角留空给形象**
 （默认锚点 bottomTrailing，在 2560×1440 上占 594×792）。天上那弯月与 app 图标是同一个母题。
 
-### 为什么是 HEIC，为什么随代码走
+#### 为什么是 HEIC，为什么随代码走
 
 它和图标是同一类资产：一次性的、不可再生成的，所以**必须随代码交付** ——
 一份没有它的检出会构建出一个「声称有配套壁纸、实际找不到素材」的 app。
@@ -89,7 +85,7 @@ HEIC 让这件事没有代价：同一张图 PNG 15.3 MB、HEIC 0.9 MB（PSNR 46
 **只入库这一张。** `WallpaperCatalog` 挑的是能盖住 5120×2880 的那个，
 其余尺寸在任何显示器上都轮不到，留着只会让人以为它们有用。
 
-### `.gitignore` 里的一个陷阱
+#### `.gitignore` 里的一个陷阱
 
 排除 PNG 母版要写 `assets/brand/wallpaper/*.png`，**不能写 `assets/brand/wallpaper/`**。
 
@@ -98,7 +94,7 @@ HEIC 让这件事没有代价：同一张图 PNG 15.3 MB、HEIC 0.9 MB（PSNR 46
 `!assets/brand/wallpaper/*.heic` 写了，看起来没问题，壁纸却一直没进仓库，
 直到一次外部代码审查指出「配套静态壁纸无法随代码交付」才暴露。
 
-### 重新生成
+#### 重新生成
 
 母版 PNG 不入库。要出别的尺寸，从 HEIC 缩即可；要重制原图，
 用 Nano Banana 2、16:9、4k，提示词的要点是：深夜湖面、左上一弯暖月、
