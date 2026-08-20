@@ -32,16 +32,19 @@ models/
 # regenerating any clip, and they are small. Only the rendered video is excluded.
 !assets/akari/keyframes/*.png
 
-# Brand assets are small and are the source of truth for the app icon.
+# Brand assets ship with the code: they are one-off, not regenerable, and a
+# checkout without them builds an app whose features have nothing to point at.
 !assets/brand/*.png
 !assets/brand/*.icns
 
-# The companion wallpaper is NOT tracked, on purpose. The three files that live
-# in assets/brand/wallpaper/ are 35MB of PNG between them, which is the same
-# "large binary" this file already keeps out for *.mov — and two of the three
-# (2560x1440, 5504x3072) can never be chosen anyway, because
-# WallpaperCatalog.rank picks the file closest to the 5120x2880 master and that
-# is the master itself on every display. A missing artwork file is not fatal:
-# WallpaperController reports 「找不到配套壁纸」 and leaves the desktop alone.
-# See assets/brand/README.md for the naming convention.
-assets/brand/wallpaper/
+# The wallpaper is the same kind of asset as the icon, so it ships too — but as
+# HEIC, which is 0.9MB against the PNG's 15.3MB at PSNR 46dB (visually lossless,
+# and smaller than AppIcon.icns). The PNG master stays out; regenerate other
+# sizes from the HEIC, or from Magnific using the prompt in assets/brand/README.md.
+#
+# NOTE: do NOT write `assets/brand/wallpaper/` here to exclude the PNGs. Excluding
+# a DIRECTORY makes every `!` rule for files inside it dead — git does not descend
+# into an excluded directory, so the negation never gets a chance to match, and it
+# fails silently. Exclude the extension, not the directory.
+assets/brand/wallpaper/*.png
+!assets/brand/wallpaper/*.heic
